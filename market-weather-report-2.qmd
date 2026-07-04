@@ -1,0 +1,1700 @@
+---
+title: "🌦️ The Market Weather Report"
+subtitle: "A plain-English forecast for the world's stock markets — plus a Sector & Theme Radar"
+date: today
+format:
+  html:
+    theme:
+      - cosmo
+      - weather-pastel.scss
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    toc-expand: 2
+    code-fold: true
+    code-tools: true
+    code-summary: "🧮 Peek at the quant machinery"
+    embed-resources: true
+    number-sections: true
+    fig-width: 10
+    fig-height: 5
+    df-print: paged
+    mainfont: "Nunito"
+execute:
+  warning: false
+  message: false
+  echo: true
+knitr:
+  opts_chunk:
+    comment: "#>"
+---
+
+```{r setup}
+#| include: false
+
+## ---- Package bootstrap: install if missing, then load quietly ----------
+need <- c("quantmod","TTR","xts","zoo","plotly","DT","forecast",
+          "rvest","httr","jsonlite","dplyr","tidyr","htmltools","tibble")
+for (p in need) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    try(install.packages(p, repos = "https://cloud.r-project.org"), silent = TRUE)
+  }
+}
+suppressPackageStartupMessages({
+  library(quantmod); library(TTR); library(xts); library(zoo)
+  library(plotly);  library(DT);  library(forecast)
+  library(rvest);   library(httr); library(jsonlite)
+  library(dplyr);   library(tidyr); library(htmltools); library(tibble)
+})
+
+options(stringsAsFactors = FALSE)
+set.seed(42)
+LOOKBACK_YEARS <- 5.6    # buffer beyond 5y so the 5-year horizon always resolves
+FROM_DATE <- Sys.Date() - round(365.25 * LOOKBACK_YEARS)
+
+## ---- 🌊 Seafoam & Sky pastel palette (single source of truth) -----------
+## Every chart, gauge and box below pulls from these tokens so the whole
+## report reads like one friendly picture book — while the maths beneath
+## stays fully grown-up.
+PAL <- list(
+  seafoam      = "#a8e6cf",  seafoam_deep = "#56c5a8",
+  sky          = "#b3e5fc",  sky_deep     = "#81cfe8",
+  butter       = "#fff3b0",  butter_deep  = "#ffe07a",
+  peach        = "#ffd3b6",
+  coral        = "#ffaaa5",  coral_deep   = "#f4837d",
+  lavender     = "#e4d9ff",
+  ink          = "#2f4858",  teal_ink     = "#00695c",
+  cloud        = "#f2fbf8",  cloud_blue   = "#eef8fd",
+  up           = "#3aa88a",  # readable pastel-compatible green for text
+  down         = "#e57368"   # readable pastel-compatible red for text
+)
+## Shared plotly cosmetics: soft background, friendly font
+pastel_layout <- function(p, ...) {
+  plotly::layout(p, ...,
+    paper_bgcolor = "#ffffff", plot_bgcolor = PAL$cloud_blue,
+    font = list(family = "Nunito, Segoe UI, sans-serif", color = PAL$ink))
+}
+## Diverging ramp for heatmaps: coral → cloud → seafoam
+pastel_diverge <- colorRamp(c(PAL$coral_deep, "#ffffff", PAL$seafoam_deep))
+```
+
+```{r universe}
+#| include: false
+
+## ---- The index universe, with a symbol map per data source -------------
+indices <- tibble::tribble(
+  ~name,               ~yahoo,        ~stooq,     ~proxy,        ~region,
+  "S&P 500",           "^GSPC",       "^spx",     "SPY",         "North America",
+  "Nasdaq Composite",  "^IXIC",       "^ndq",     "ONEQ",        "North America",
+  "Dow Jones",         "^DJI",        "^dji",     "DIA",         "North America",
+  "Russell 2000",      "^RUT",        "^rut",     "IWM",         "North America",
+  "TSX Composite",     "^GSPTSE",     "^tsx",     "EWC",         "North America",
+  "FTSE 100",          "^FTSE",       "^ukx",     "EWU",         "Europe",
+  "DAX",               "^GDAXI",      "^dax",     "EWG",         "Europe",
+  "CAC 40",            "^FCHI",       "^cac",     "EWQ",         "Europe",
+  "Euro Stoxx 50",     "^STOXX50E",   "^stx50",   "FEZ",         "Europe",
+  "IBEX 35",           "^IBEX",       "^ibex",    "EWP",         "Europe",
+  "FTSE MIB",          "FTSEMIB.MI",  "^mib",     "EWI",         "Europe",
+  "SMI (Swiss)",       "^SSMI",       "^smi",     "EWL",         "Europe",
+  "Nikkei 225",        "^N225",       "^nkx",     "EWJ",         "Asia-Pacific",
+  "TOPIX",             "1475.T",      "^tpx",     "EWJ",         "Asia-Pacific",
+  "Hang Seng",         "^HSI",        "^hsi",     "EWH",         "Asia-Pacific",
+  "Shanghai Comp.",    "000001.SS",   "^shc",     "ASHR",        "Asia-Pacific",
+  "KOSPI",             "^KS11",       "^kospi",   "EWY",         "Asia-Pacific",
+  "ASX 200",           "^AXJO",       "^axjo",    "EWA",         "Asia-Pacific",
+  "Sensex",            "^BSESN",      "^snx",     "INDA",        "Asia-Pacific",
+  "Nifty 50",          "^NSEI",       "^nsei",    "INDA",        "Asia-Pacific",
+  "Bovespa",           "^BVSP",       "^bvp",     "EWZ",         "Latin America",
+  "VIX (volatility)",  "^VIX",        "^vix",     NA_character_, "Volatility"
+)
+## `proxy` = US-listed backup ETF used ONLY as a last real-data resort when
+## every direct source for the index fails. Country ETFs approximate their
+## index (currency and holdings differ slightly) — the source table always
+## shows when a proxy was used, so nothing happens silently.
+## TOPIX note: ^TPX is not on Yahoo; 1475.T = iShares Core TOPIX ETF.
+
+## ---- The SECTOR / THEME universe ----------------------------------------
+## Themes are tracked through their most liquid ETF (identical fallback
+## cascade works), plus native symbols for crypto and commodity futures.
+sectors <- tibble::tribble(
+  ~name,                          ~yahoo,     ~stooq,          ~proxy,        ~theme,
+  "Quantum Computing (QTUM)",     "QTUM",     "qtum.us",       NA_character_, "Tech Frontier",
+  "AI & Robotics (BOTZ)",         "BOTZ",     "botz.us",       "ROBO",        "Tech Frontier",
+  "Semiconductors / AI HW (SMH)", "SMH",      "smh.us",        "SOXX",        "Tech Frontier",
+  "Cybersecurity (CIBR)",         "CIBR",     "cibr.us",       "HACK",        "Tech Frontier",
+  "Biotech (XBI)",                "XBI",      "xbi.us",        "IBB",         "Tech Frontier",
+  "Space (ARKX)",                 "ARKX",     "arkx.us",       NA_character_, "Tech Frontier",
+  "Defense & Aerospace (ITA)",    "ITA",      "ita.us",        "PPA",         "Cyclicals & Defense",
+  "Financials (XLF)",             "XLF",      "xlf.us",        "VFH",         "Cyclicals & Defense",
+  "Industrials (XLI)",            "XLI",      "xli.us",        "VIS",         "Cyclicals & Defense",
+  "Energy broad (XLE)",           "XLE",      "xle.us",        "VDE",         "Energy",
+  "Clean Energy (ICLN)",          "ICLN",     "icln.us",       "TAN",         "Energy",
+  "Uranium & Nuclear (URA)",      "URA",      "ura.us",        "URNM",        "Energy",
+  "Crude Oil WTI (CL=F)",         "CL=F",     "cl.f",          "USO",         "Commodities",
+  "Gold (GLD)",                   "GLD",      "gld.us",        "IAU",         "Commodities",
+  "Silver (SLV)",                 "SLV",      "slv.us",        "SIVR",        "Commodities",
+  "Copper Miners (COPX)",         "COPX",     "copx.us",       NA_character_, "Commodities",
+  "Rare Earths (REMX)",           "REMX",     "remx.us",       NA_character_, "Commodities",
+  "Bitcoin",                      "BTC-USD",  "btcusd",        "IBIT",        "Crypto",
+  "Ethereum",                     "ETH-USD",  "ethusd",        "ETHA",        "Crypto",
+  "Solana",                       "SOL-USD",  NA_character_,   NA_character_, "Crypto"
+)
+## Sector proxies = near-identical competitor ETFs tracking the same theme
+## (e.g. IAU backs up GLD, SOXX backs up SMH) — real data, same exposure.
+```
+
+```{r fetch-engine}
+#| include: false
+
+## ============================================================
+##  DATA FETCH ENGINE v2 — reliability-first, 100% key-less.
+##  Up to 8 REAL sources per asset, every network call retried
+##  3x with backoff. STRICT mode (the default) refuses to build
+##  the report on anything but complete real data: if every real
+##  source fails for any asset, the render ABORTS with a clear
+##  error naming the culprits — so an incomplete or simulated
+##  report can never be generated, let alone published.
+##  Set env STRICT_DATA=false to re-enable the simulated fallback
+##  (useful only for offline testing of the layout).
+## ============================================================
+
+UA <- "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+STRICT_DATA <- !identical(tolower(Sys.getenv("STRICT_DATA", "true")), "false")
+
+## Retry any flaky network call: 3 attempts, pausing 1s then 4s.
+## Transient hiccups (rate limits, timeouts) are the #1 failure mode,
+## so this alone eliminates most "source down" events.
+with_retry <- function(fn, tries = 3, pause = c(1, 4)) {
+  out <- NULL
+  for (i in seq_len(tries)) {
+    out <- tryCatch(fn(), error = function(e) e)
+    if (!inherits(out, "error")) return(out)
+    if (i < tries) Sys.sleep(pause[min(i, length(pause))])
+  }
+  stop(conditionMessage(out))
+}
+
+ohlc_ok <- function(x) !is.null(x) && nrow(x) >= 30
+
+## --- Sources 1+2: Yahoo Finance v8 chart JSON (two independent hosts) ---
+src_yahoo_json <- function(sym_yahoo, host = "query1", from = FROM_DATE) {
+  if (is.na(sym_yahoo)) return(NULL)
+  enc <- utils::URLencode(sym_yahoo, reserved = TRUE)
+  url <- sprintf(
+    "https://%s.finance.yahoo.com/v8/finance/chart/%s?period1=%d&period2=%d&interval=1d",
+    host, enc, as.integer(as.POSIXct(from)), as.integer(Sys.time()))
+  r <- httr::GET(url, httr::add_headers(`User-Agent` = UA), httr::timeout(20))
+  if (httr::status_code(r) != 200) stop("HTTP ", httr::status_code(r))
+  j <- jsonlite::fromJSON(httr::content(r, "text", encoding = "UTF-8"),
+                          simplifyVector = FALSE)
+  res <- j$chart$result[[1]]
+  ts  <- as.numeric(unlist(res$timestamp))
+  q   <- res$indicators$quote[[1]]
+  nn  <- function(x) vapply(x, function(v) if (is.null(v)) NA_real_ else as.numeric(v), numeric(1))
+  df  <- data.frame(Open = nn(q$open), High = nn(q$high),
+                    Low = nn(q$low),  Close = nn(q$close),
+                    Volume = nn(q$volume))
+  x <- xts(df, order.by = as.Date(as.POSIXct(ts, origin = "1970-01-01")))
+  x <- x[!is.na(x$Close), ]
+  if (nrow(x) < 30) stop("too few rows")
+  x
+}
+
+## --- Source 3: quantmod getSymbols(src="yahoo") -------------------------
+src_quantmod_yahoo <- function(sym_yahoo, from = FROM_DATE) {
+  if (is.na(sym_yahoo)) return(NULL)
+  x <- quantmod::getSymbols(sym_yahoo, src = "yahoo", from = from,
+                            auto.assign = FALSE, warnings = FALSE)
+  colnames(x) <- c("Open","High","Low","Close","Volume","Adjusted")[seq_len(ncol(x))]
+  if (nrow(x) < 30) stop("too few rows")
+  x[, c("Open","High","Low","Close","Volume")]
+}
+
+## --- Source 4: quantmod getSymbols(src="stooq") -------------------------
+src_quantmod_stooq <- function(sym_stooq, from = FROM_DATE) {
+  if (is.na(sym_stooq)) return(NULL)
+  x <- quantmod::getSymbols(sym_stooq, src = "stooq",
+                            auto.assign = FALSE, warnings = FALSE)
+  x <- x[paste0(from, "/")]
+  colnames(x) <- c("Open","High","Low","Close","Volume")[seq_len(ncol(x))]
+  if (nrow(x) < 30) stop("too few rows")
+  x
+}
+
+## --- Source 5: direct Stooq CSV endpoint --------------------------------
+src_stooq_csv <- function(sym_stooq, from = FROM_DATE) {
+  if (is.na(sym_stooq)) return(NULL)
+  url <- sprintf("https://stooq.com/q/d/l/?s=%s&i=d", sym_stooq)
+  r <- httr::GET(url, httr::add_headers(`User-Agent` = UA), httr::timeout(20))
+  txt <- httr::content(r, "text", encoding = "UTF-8")
+  if (!grepl("^Date", txt)) stop("no CSV header (throttled?)")
+  df <- utils::read.csv(text = txt)
+  x <- xts(df[, c("Open","High","Low","Close",
+                  if ("Volume" %in% names(df)) "Volume")],
+           order.by = as.Date(df$Date))
+  x <- x[paste0(from, "/")]
+  if (nrow(x) < 30) stop("too few rows")
+  x
+}
+
+## --- Source 8 (last real resort): FRED official close-only series -------
+## The St. Louis Fed — about as reliable as data sources get. Close-only,
+## so OHLC is collapsed to the close (trend metrics unaffected; candles
+## degrade to bars) — which is why it sits LAST among the real sources.
+FRED_MAP <- c("S&P 500" = "SP500", "Nasdaq Composite" = "NASDAQCOM",
+              "Dow Jones" = "DJIA", "Nikkei 225" = "NIKKEI225",
+              "VIX (volatility)" = "VIXCLS")
+src_fred_close <- function(name, from = FROM_DATE) {
+  if (is.na(name) || !(name %in% names(FRED_MAP))) return(NULL)
+  x <- quantmod::getSymbols(FRED_MAP[[name]], src = "FRED", auto.assign = FALSE)
+  x <- x[!is.na(x[, 1]), ]; x <- x[paste0(from, "/")]
+  cl <- as.numeric(x[, 1])
+  out <- xts(cbind(Open = cl, High = cl, Low = cl, Close = cl, Volume = 0),
+             order.by = as.Date(index(x)))
+  if (nrow(out) < 30) stop("too few rows")
+  out
+}
+
+## --- Simulated fallback — DISABLED in strict mode -------------------------
+## Kept only for offline layout testing (STRICT_DATA=false). Deterministic
+## geometric Brownian motion seeded by symbol.
+src_simulated <- function(sym_yahoo, from = FROM_DATE) {
+  if (is.na(sym_yahoo) || !nzchar(sym_yahoo)) sym_yahoo <- "FALLBACK"
+  seedn <- sum(utils::head(utils::adist(sym_yahoo, letters)[1, ], 5)) +
+           nchar(sym_yahoo) * 7
+  set.seed(seedn)
+  days <- seq(from, Sys.Date(), by = "day")
+  if (!grepl("-USD", sym_yahoo)) {               # crypto trades 7 days a week
+    days <- days[!weekdays(days) %in% c("Saturday","Sunday")]
+  }
+  n <- length(days)
+  base <- if (grepl("VIX", sym_yahoo)) 18
+          else if (grepl("BTC", sym_yahoo)) 60000
+          else if (grepl("-USD", sym_yahoo)) 2000
+          else if (grepl("=F", sym_yahoo)) 75
+          else if (grepl("\\^", sym_yahoo)) 3000 else 80
+  drift <- if (grepl("VIX", sym_yahoo)) 0 else 0.0003
+  vol   <- if (grepl("VIX", sym_yahoo)) 0.06
+           else if (grepl("-USD", sym_yahoo)) 0.03 else 0.011
+  ret <- rnorm(n, drift, vol)
+  close <- base * cumprod(1 + ret)
+  open  <- close / (1 + rnorm(n, 0, vol/3))
+  high  <- pmax(open, close) * (1 + abs(rnorm(n, 0, vol/2)))
+  low   <- pmin(open, close) * (1 - abs(rnorm(n, 0, vol/2)))
+  volm  <- round(runif(n, 1e8, 5e8))
+  xts(cbind(Open=open, High=high, Low=low, Close=close, Volume=volm),
+      order.by = days)
+}
+
+## --- The cascade: up to 8 real attempts, each internally retried 3x ------
+fetch_series <- function(row) {
+  y  <- row$yahoo
+  s  <- row$stooq
+  pr <- if (!is.null(row$proxy)) row$proxy else NA_character_
+  nm <- if (!is.null(row$name))  row$name  else NA_character_
+  prs <- if (!is.na(pr)) paste0(tolower(pr), ".us") else NA_character_
+  attempts <- list(
+    list(name = "Yahoo v8 JSON",          fn = function() with_retry(function() src_yahoo_json(y, "query1"))),
+    list(name = "Yahoo v8 JSON (host 2)", fn = function() with_retry(function() src_yahoo_json(y, "query2"))),
+    list(name = "quantmod/Yahoo",         fn = function() with_retry(function() src_quantmod_yahoo(y))),
+    list(name = "quantmod/Stooq",         fn = function() with_retry(function() src_quantmod_stooq(s))),
+    list(name = "Stooq CSV",              fn = function() with_retry(function() src_stooq_csv(s))),
+    list(name = sprintf("Backup ETF %s (Yahoo)", pr), fn = function() with_retry(function() src_yahoo_json(pr, "query1"))),
+    list(name = sprintf("Backup ETF %s (Stooq)", pr), fn = function() with_retry(function() src_stooq_csv(prs))),
+    list(name = "FRED close-only",        fn = function() with_retry(function() src_fred_close(nm)))
+  )
+  for (a in attempts) {
+    out <- tryCatch(a$fn(), error = function(e) NULL)
+    if (ohlc_ok(out)) { attr(out, "source") <- a$name; return(out) }
+  }
+  if (STRICT_DATA) return(NULL)          # caller aborts the render loudly
+  out <- src_simulated(y); attr(out, "source") <- "Simulated (demo)"; out
+}
+
+## --- Fetch BOTH universes; in strict mode, abort on ANY failure ----------
+## A short jittered pause between assets keeps Yahoo from rate-limiting the
+## run (HTTP 429) — the single most common failure mode on shared CI IPs
+## like GitHub Actions runners. Costs ~25s total, saves whole renders.
+polite_pause <- function() Sys.sleep(stats::runif(1, 0.4, 0.9))
+
+market <- list(); source_log <- character(0); failed_assets <- character(0)
+for (i in seq_len(nrow(indices))) {
+  if (i > 1) polite_pause()
+  s <- fetch_series(indices[i, ])
+  if (is.null(s)) { failed_assets <- c(failed_assets, indices$name[i]); next }
+  market[[indices$name[i]]] <- s
+  source_log[indices$name[i]] <- attr(s, "source")
+}
+
+sector_data <- list(); sector_source_log <- character(0)
+for (i in seq_len(nrow(sectors))) {
+  polite_pause()
+  s <- fetch_series(sectors[i, ])
+  if (is.null(s)) { failed_assets <- c(failed_assets, sectors$name[i]); next }
+  sector_data[[sectors$name[i]]] <- s
+  sector_source_log[sectors$name[i]] <- attr(s, "source")
+}
+
+if (STRICT_DATA && length(failed_assets)) {
+  stop("STRICT DATA MODE — render aborted so an incomplete report is never produced. ",
+       "Every real source failed (after retries) for: ",
+       paste(failed_assets, collapse = ", "), ". ",
+       "This is almost always transient — re-run the workflow in a few minutes. ",
+       "To allow simulated placeholders instead, set env STRICT_DATA=false.")
+}
+
+USING_DEMO <- length(source_log) > 0 &&
+              all(c(source_log, sector_source_log) == "Simulated (demo)")
+ANY_DEMO   <- any(c(source_log, sector_source_log) == "Simulated (demo)")
+```
+
+```{r indicators}
+#| include: false
+
+## ---- Per-series indicator computation -----------------------------------
+calc_metrics <- function(x, name) {
+  cl <- as.numeric(Cl(x)); dt <- index(x); n <- length(cl)
+  last <- cl[n]
+  sma50  <- if (n >= 50)  as.numeric(SMA(cl, 50))[n]  else NA
+  sma200 <- if (n >= 200) as.numeric(SMA(cl, 200))[n] else NA
+  rsi14  <- if (n >= 15)  as.numeric(RSI(cl, 14))[n]  else NA
+  macd_df <- if (n >= 35) tryCatch(TTR::MACD(cl), error=function(e) NULL) else NULL
+  macd_hist <- if (!is.null(macd_df)) as.numeric(macd_df[n,"macd"] - macd_df[n,"signal"]) else NA
+  roc20 <- if (n >= 21) (last/cl[n-20]-1)*100 else NA
+  roc60 <- if (n >= 61) (last/cl[n-60]-1)*100 else NA
+  hi52 <- max(cl[dt >= (max(dt)-365)]); lo52 <- min(cl[dt >= (max(dt)-365)])
+  from_hi <- (last/hi52 - 1)*100
+  from_lo <- (last/lo52 - 1)*100
+  ## golden / death cross over last 10 sessions
+  cross <- "none"
+  if (n >= 205) {
+    s50 <- SMA(cl,50); s200 <- SMA(cl,200)
+    d <- sign(s50 - s200); d <- d[!is.na(d)]
+    if (length(d) > 11) {
+      recent <- tail(d, 11)
+      if (any(diff(recent) > 0)) cross <- "golden"
+      if (any(diff(recent) < 0)) cross <- "death"
+    }
+  }
+  ## 50d MA slope: rising vs 10 sessions ago?
+  ma_rising <- NA
+  if (n >= 60) {
+    s50v <- as.numeric(SMA(cl, 50))
+    ma_rising <- s50v[n] > s50v[n - 10]
+  }
+  ret1d <- if (n>=2) (last/cl[n-1]-1)*100 else NA
+  data.frame(
+    Index = name, Last = last, Ret1D = ret1d, ROC20 = roc20, ROC60 = roc60,
+    RSI = rsi14, MACDhist = macd_hist,
+    SMA50 = sma50, SMA200 = sma200,
+    AboveSMA200 = ifelse(is.na(sma200), NA, last > sma200),
+    FromHigh = from_hi, FromLow = from_lo, Cross = cross,
+    MArising = ma_rising,
+    stringsAsFactors = FALSE)
+}
+
+equity_names <- setdiff(names(market), "VIX (volatility)")
+metrics <- do.call(rbind, lapply(equity_names,
+             function(nm) calc_metrics(market[[nm]], nm)))
+rownames(metrics) <- NULL
+
+sector_metrics <- do.call(rbind, lapply(names(sector_data),
+             function(nm) calc_metrics(sector_data[[nm]], nm)))
+rownames(sector_metrics) <- NULL
+
+## VIX helpers
+vix_x <- market[["VIX (volatility)"]]
+vix_last <- as.numeric(Cl(vix_x))[nrow(vix_x)]
+vix_avg  <- mean(tail(as.numeric(Cl(vix_x)), 60), na.rm = TRUE)
+```
+
+```{r horizons}
+#| include: false
+
+## ============================================================
+##  TIME-HORIZON MACHINERY
+##  Backward: returns over 1w / 1m / 3m / 6m / 1y / 5y.
+##  Forward:  one auto.arima fit per key asset, horizons read
+##            off a single 252-step forecast (5/21/63/126/252).
+##  No 5-year-ahead forecast on purpose — not reliable.
+## ============================================================
+HORIZONS <- c(`1 Week` = 7, `1 Month` = 30, `3 Months` = 91,
+              `6 Months` = 182, `1 Year` = 365, `5 Years` = 1826)
+
+## Business-day sequence: forecast steps are TRADING days, so plotting them on
+## calendar days would land the "1 year ahead" mark at ~8.3 months on the axis.
+next_bdays <- function(after, n) {
+  d <- seq(after + 1, by = "day", length.out = ceiling(n * 1.6) + 7)
+  head(d[!weekdays(d) %in% c("Saturday", "Sunday")], n)
+}
+
+ret_over <- function(x, days) {
+  cl <- as.numeric(Cl(x)); dt <- index(x); n <- length(cl)
+  idx <- which(dt <= (max(dt) - days))
+  if (!length(idx)) return(NA_real_)
+  (cl[n] / cl[max(idx)] - 1) * 100
+}
+
+all_series <- c(market[equity_names], sector_data)
+horizon_tbl <- data.frame(Asset = names(all_series), stringsAsFactors = FALSE)
+for (h in names(HORIZONS)) {
+  horizon_tbl[[h]] <- vapply(all_series,
+                             function(x) ret_over(x, HORIZONS[[h]]), numeric(1))
+}
+horizon_tbl$Type <- ifelse(horizon_tbl$Asset %in% indices$name, "Index", "Theme")
+
+FC_STEPS <- c(`1 Week ahead` = 5, `1 Month ahead` = 21, `3 Months ahead` = 63,
+              `6 Months ahead` = 126, `1 Year ahead` = 252)
+
+horizon_forecast <- function(x, name, fit_len = 750) {
+  cl <- as.numeric(Cl(x)); cl <- cl[!is.na(cl)]
+  fit <- tryCatch(forecast::auto.arima(tail(cl, fit_len)), error = function(e) NULL)
+  if (is.null(fit)) fit <- tryCatch(forecast::ets(tail(cl, fit_len)),
+                                    error = function(e) NULL)
+  if (is.null(fit)) return(NULL)
+  fc <- forecast::forecast(fit, h = 252, level = c(80, 95))
+  last <- tail(cl, 1)
+  data.frame(Asset   = name,
+             Horizon = names(FC_STEPS),
+             Point   = round(as.numeric(fc$mean[FC_STEPS]), 2),
+             `Chg %` = round((as.numeric(fc$mean[FC_STEPS]) / last - 1) * 100, 1),
+             Lo95    = round(as.numeric(fc$lower[FC_STEPS, 2]), 2),
+             Hi95    = round(as.numeric(fc$upper[FC_STEPS, 2]), 2),
+             check.names = FALSE, stringsAsFactors = FALSE)
+}
+```
+
+```{r trend-scores}
+#| include: false
+
+## ============================================================
+##  SECTOR TREND SCORE (0-100) — trend-first by design, since
+##  many themes trade disconnected from fundamental value.
+##  Components (points):
+##    15  price above 50d MA
+##    15  price above 200d MA
+##    10  50d MA above 200d MA (bullish alignment)
+##    15  50d MA rising vs 10 sessions ago
+##    15  ROC20 scaled from -10%..+10%  -> 0..15
+##    20  ROC60 scaled from -20%..+20%  -> 0..20
+##    10  proximity to 52w high: -30%..0% -> 0..10
+## ============================================================
+trend_score <- function(m) {
+  clamp <- function(v, lo, hi) pmin(pmax(v, lo), hi)
+  p <- 0
+  p <- p + 15 * ifelse(is.na(m$SMA50),  0.5, as.numeric(m$Last > m$SMA50))
+  p <- p + 15 * ifelse(is.na(m$SMA200), 0.5, as.numeric(m$Last > m$SMA200))
+  p <- p + 10 * ifelse(is.na(m$SMA50) | is.na(m$SMA200), 0.5,
+                       as.numeric(m$SMA50 > m$SMA200))
+  p <- p + 15 * ifelse(is.na(m$MArising), 0.5, as.numeric(m$MArising))
+  ## NA-safe: short histories get neutral credit instead of poisoning the score
+  p <- p + 15 * ifelse(is.na(m$ROC20),    0.5, clamp((m$ROC20 + 10) / 20, 0, 1))
+  p <- p + 20 * ifelse(is.na(m$ROC60),    0.5, clamp((m$ROC60 + 20) / 40, 0, 1))
+  p <- p + 10 * ifelse(is.na(m$FromHigh), 0.5, clamp((m$FromHigh + 30) / 30, 0, 1))
+  round(p)
+}
+sector_metrics$Trend <- trend_score(sector_metrics)
+
+## ---- Relative strength vs S&P 500 (60-day change of ratio) --------------
+spx_cl <- Cl(market[["S&P 500"]])
+rel_strength_60d <- function(x) {
+  merged <- merge(Cl(x), spx_cl, join = "inner")
+  merged <- merged[complete.cases(merged), ]
+  if (nrow(merged) < 61) return(NA_real_)
+  ratio <- as.numeric(merged[,1]) / as.numeric(merged[,2])
+  n <- length(ratio)
+  (ratio[n] / ratio[n-60] - 1) * 100
+}
+sector_metrics$RSvsSPX60 <- vapply(sector_metrics$Index,
+  function(nm) rel_strength_60d(sector_data[[nm]]), numeric(1))
+
+## ---- Sector weather one-liners (pure if/else) ----------------------------
+sector_weather <- function(s) {
+  if (is.na(s))     c("❓",   "Not enough history yet to score this trend reliably.")
+  else if (s >= 80) c("🔥☀️", "Blazing uptrend — momentum is hot; strong trends can persist but run fast when they break.")
+  else if (s >= 65) c("📈🌤️", "Healthy uptrend — the wind is at this theme's back.")
+  else if (s >= 50) c("➡️⛅", "Drifting sideways with a mild positive tilt.")
+  else if (s >= 35) c("🌥️",  "Losing altitude — the trend is cooling; watch support levels.")
+  else if (s >= 20) c("🌧️",  "Downtrend — assume rain until the tape proves otherwise.")
+  else              c("🧊⛈️", "Deep freeze — falling and frozen out; wait for a thaw before wading in.")
+}
+sw <- t(vapply(sector_metrics$Trend, sector_weather, character(2)))
+sector_metrics$Sky     <- sw[, 1]
+sector_metrics$Reading <- sw[, 2]
+
+## ---- Same weather treatment for the world indices ------------------------
+## (identical scoring function, so index and theme skies are comparable)
+metrics$Trend <- trend_score(metrics)
+swi <- t(vapply(metrics$Trend, sector_weather, character(2)))
+metrics$Sky     <- swi[, 1]
+metrics$Reading <- swi[, 2]
+```
+
+```{r valuation}
+#| include: false
+
+## ---- Live valuation scrapes with fallbacks -----------------------------
+scrape_multpl <- function(slug) {
+  url <- paste0("https://www.multpl.com/", slug)
+  out <- tryCatch({
+    h <- rvest::read_html(httr::content(
+      httr::GET(url, httr::add_headers(`User-Agent`=UA), httr::timeout(20)), "text"))
+    txt <- rvest::html_text(rvest::html_element(h, "#current"))
+    as.numeric(gsub("[^0-9.]", "", regmatches(txt, regexpr("[0-9.]+", txt))))
+  }, error = function(e) NA_real_)
+  ## Guard: a blocked/changed page yields numeric(0), which would crash
+  ## `if (is.na(cape))` downstream ("argument is of length zero").
+  if (!length(out) || !is.finite(out[1])) NA_real_ else out[1]
+}
+cape <- scrape_multpl("shiller-pe")          # Shiller CAPE
+pe   <- scrape_multpl("s-p-500-pe-ratio")    # trailing P/E
+## Last-known-good fallbacks (refresh periodically): mid-2026 CAPE ~41.7, P/E ~29
+if (is.na(cape)) cape <- 41.7
+if (is.na(pe))   pe   <- 29.0
+
+## Buffett Indicator proxy: FRED SP500 / GDP (WILL5000PR removed 2024-06-03)
+buffett <- tryCatch({
+  sp  <- getSymbols("SP500", src = "FRED", auto.assign = FALSE)
+  gdp <- getSymbols("GDP",   src = "FRED", auto.assign = FALSE)
+  spv  <- as.numeric(last(sp[!is.na(sp)]))
+  gdpv <- as.numeric(last(gdp[!is.na(gdp)]))
+  (spv / gdpv) * 100      # index-points-per-$bn proxy, NOT true % of GDP
+}, error = function(e) NA_real_)
+
+## Technical overboughtness across equity universe
+pct_above200 <- mean(metrics$AboveSMA200, na.rm = TRUE) * 100
+avg_rsi      <- mean(metrics$RSI, na.rm = TRUE)
+
+## ---- Composite 0-100 valuation / overbought score ----------------------
+sc_cape <- 100 * pmin(pmax((cape - 10) / (44 - 10), 0), 1)  # 10..44 range
+sc_pe   <- 100 * pmin(pmax((pe   -  8) / (30 -  8), 0), 1)
+sc_rsi  <- 100 * pmin(pmax((avg_rsi - 30) / (70 - 30), 0), 1)
+sc_brd  <- pct_above200
+composite <- round(0.35*sc_cape + 0.20*sc_pe + 0.20*sc_rsi + 0.25*sc_brd)
+
+## ---- Fear/greed style gauge (0 fear .. 100 greed) ----------------------
+fg_mom  <- 100 * pmin(pmax((mean(metrics$ROC20, na.rm=TRUE) + 8)/16, 0), 1)
+fg_vol  <- 100 * pmin(pmax((vix_avg - vix_last)/vix_avg + 0.5, 0), 1)
+fg_brd  <- pct_above200
+fear_greed <- round((fg_mom + fg_vol + fg_brd)/3)
+```
+
+```{r macro-radar}
+#| include: false
+
+## ============================================================
+##  🛰️ MACRO RADAR — three grown-up indicators, all free and
+##  key-less, translated into plain English downstream:
+##   1) Yield curve (10y − 2y Treasury) — the bond market's
+##      recession alarm (FRED, no API key required)
+##   2) Credit stress — junk bonds (HYG) vs quality bonds (LQD);
+##      when lenders get nervous, this ratio rolls over first
+##   3) S&P 500 drawdown — "how far underwater" from the peak
+##  Plus HISTORICAL ODDS: honest win-rates computed from the
+##  fetched data itself, so probabilities are empirical.
+## ============================================================
+
+## 1) Yield curve spread (10y − 2y), FRED — key-less
+yield_curve <- tryCatch({
+  d10 <- getSymbols("DGS10", src = "FRED", auto.assign = FALSE)
+  d02 <- getSymbols("DGS2",  src = "FRED", auto.assign = FALSE)
+  yc  <- merge(d10, d02, join = "inner"); yc <- yc[complete.cases(yc), ]
+  s <- yc[, 1] - yc[, 2]; colnames(s) <- "Spread10y2y"
+  tail(s, 1500)
+}, error = function(e) NULL)
+yc_now      <- if (!is.null(yield_curve)) as.numeric(last(yield_curve)) else NA_real_
+yc_inverted <- isTRUE(yc_now < 0)
+
+## 2) Credit stress proxy: HYG / LQD through the same fetch cascade
+hyg <- fetch_series(list(yahoo = "HYG", stooq = "hyg.us"))
+lqd <- fetch_series(list(yahoo = "LQD", stooq = "lqd.us"))
+credit_demo <- any(c(attr(hyg, "source"), attr(lqd, "source")) == "Simulated (demo)")
+credit_ratio <- tryCatch({
+  m <- merge(Cl(hyg), Cl(lqd), join = "inner"); m <- m[complete.cases(m), ]
+  r <- m[, 1] / m[, 2]; colnames(r) <- "HYGoverLQD"; r
+}, error = function(e) NULL)
+credit_stress <- FALSE; credit_roc20 <- NA_real_; credit_below200 <- NA
+if (!is.null(credit_ratio) && nrow(credit_ratio) > 220) {
+  cr  <- as.numeric(credit_ratio); ncr <- length(cr)
+  cr200 <- as.numeric(SMA(cr, 200))[ncr]
+  credit_roc20    <- (cr[ncr] / cr[ncr - 20] - 1) * 100
+  credit_below200 <- cr[ncr] < cr200
+  credit_stress   <- isTRUE(credit_below200) && isTRUE(credit_roc20 < 0)
+}
+
+## 3) Drawdown ("underwater") series for the S&P 500
+spx_close <- as.numeric(Cl(market[["S&P 500"]]))
+spx_dates <- index(Cl(market[["S&P 500"]]))
+dd_series <- (spx_close / cummax(spx_close) - 1) * 100
+dd_now    <- tail(dd_series, 1)
+
+## 4) HISTORICAL ODDS — empirical win-rates over the fetched lookback
+win_rate <- function(cl, k) {          # % of k-day windows that ended higher
+  n <- length(cl); if (n <= k + 1) return(NA_real_)
+  mean(cl[(k + 1):n] > cl[1:(n - k)], na.rm = TRUE) * 100
+}
+ODDS_WINDOWS <- c(`1 day` = 1, `1 week` = 5, `1 month` = 21,
+                  `3 months` = 63, `6 months` = 126, `1 year` = 252)
+odds_vals <- vapply(ODDS_WINDOWS, function(k) win_rate(spx_close, k), numeric(1))
+coin_note <- function(p) {
+  if (is.na(p)) "…"
+  else if (p >= 85) "🎯 Very strong odds — but never a guarantee"
+  else if (p >= 70) "👍 Clearly better than a coin flip"
+  else if (p >= 55) "🪙 A slightly loaded coin, nothing more"
+  else if (p >= 45) "🪙 Basically a coin flip"
+  else "👎 Worse than a coin flip over this stretch"
+}
+odds_tbl <- data.frame(
+  `If you had picked a random...` = paste0(names(ODDS_WINDOWS), " window"),
+  `Chance it ended higher` = sprintf("%.0f%%", odds_vals),
+  `In plain English` = vapply(odds_vals, coin_note, character(1)),
+  check.names = FALSE)
+
+## Conditional odds: does the 200-day average actually matter? Show, don't tell.
+sma200v  <- as.numeric(SMA(spx_close, 200))
+n_spx    <- length(spx_close)
+fwd21    <- rep(NA_real_, n_spx)
+fwd21[1:(n_spx - 21)] <- spx_close[22:n_spx] / spx_close[1:(n_spx - 21)] - 1
+above_ma <- !is.na(sma200v) & spx_close > sma200v
+below_ma <- !is.na(sma200v) & spx_close <= sma200v
+odds_above <- mean(fwd21[above_ma] > 0, na.rm = TRUE) * 100
+odds_below <- mean(fwd21[below_ma] > 0, na.rm = TRUE) * 100
+regime_above_now <- isTRUE(spx_close[n_spx] > sma200v[n_spx])
+```
+
+```{r bear-watch-calc}
+#| include: false
+
+## ============================================================
+##  🐻 BEAR WATCH — explicit warning lights, always checked.
+## ============================================================
+sp_row  <- metrics[metrics$Index == "S&P 500", ]
+gold_rs <- sector_metrics$RSvsSPX60[sector_metrics$Index == "Gold (GLD)"]
+btc_roc <- sector_metrics$ROC20[sector_metrics$Index == "Bitcoin"]
+near_hi_weak <- isTRUE(sp_row$FromHigh > -3) && !is.na(sp_row$RSI) && sp_row$RSI < 55
+
+bear_signals <- data.frame(
+  Signal = c(
+    "S&P 500 below its 200-day average (long-term trend broken)",
+    "S&P 500 in correction territory (>10% off its high)",
+    "S&P 500 in a bear market (>20% off its high)",
+    "Fewer than half of world indices above their 200-day average (breadth broken)",
+    "Recent death cross in one or more major indices",
+    "VIX at or above 25 (storm-force winds)",
+    "VIX spiking >20% above its 60-day average (fear accelerating)",
+    "Average 20-day momentum across world indices is negative",
+    "Weak internals: S&P near its high but RSI soft (negative-divergence proxy)",
+    "Safe-haven rotation: gold beating stocks while stocks fall",
+    "Risk appetite draining: Bitcoin down >15% in a month",
+    "Composite heat score >= 70 — overheated markets fall hardest",
+    "Recession radar: yield curve inverted (10y under 2y — the bond market bracing for trouble)",
+    "Credit stress: junk bonds losing to quality bonds (HYG/LQD below trend and falling)"),
+  Triggered = c(
+    !isTRUE(sp_row$AboveSMA200),
+    isTRUE(sp_row$FromHigh <= -10),
+    isTRUE(sp_row$FromHigh <= -20),
+    pct_above200 < 50,
+    any(metrics$Cross == "death"),
+    vix_last >= 25,
+    vix_last > 1.2 * vix_avg,
+    mean(metrics$ROC20, na.rm = TRUE) < 0,
+    near_hi_weak,
+    isTRUE(gold_rs > 0) && isTRUE(sp_row$ROC20 < 0),
+    isTRUE(btc_roc < -15),
+    composite >= 70,
+    yc_inverted,
+    credit_stress && !credit_demo),
+  stringsAsFactors = FALSE)
+bear_signals$Triggered[is.na(bear_signals$Triggered)] <- FALSE
+bear_total <- nrow(bear_signals)
+bear_score <- round(mean(bear_signals$Triggered) * 100)
+bear_n     <- sum(bear_signals$Triggered)
+
+## Bear alert tiers — pure if/else, plain English
+bear_tier <- function(score, n, total = bear_total) {
+  if (score >= 60) list(col = "#d9635b", icon = "🐻⛈️🚨",
+    head = sprintf("BEAR ALERT — %d of %d warning lights are ON", n, total),
+    body = "This is what the early-to-middle innings of serious downturns look like. Capital preservation beats bravado here: storms of this kind can intensify quickly and the exits get crowded.")
+  else if (score >= 40) list(col = PAL$coral_deep, icon = "🐻🌧️",
+    head = sprintf("High bear risk — %d of %d warning lights are ON", n, total),
+    body = "Multiple independent warning systems are flashing at once. Historically, clusters like this precede the market's worst stretches more often than random chance. Tighten risk now, not after the fact.")
+  else if (score >= 25) list(col = "#f7b98b", icon = "🐻⚠️",
+    head = sprintf("Caution — %d of %d warning lights are ON", n, total),
+    body = "Cracks are forming under a market that may still look fine on the surface. This is the zone where complacency costs the most — small hedges are cheap while skies are only partly cloudy.")
+  else if (score >= 10) list(col = PAL$butter_deep, icon = "🐻👀",
+    head = sprintf("Watchful — %d of %d warning lights are ON", n, total),
+    body = "Mostly clear, but never mistake calm for safety: the biggest single-day storms in history arrived with few warning lights on. Keep the checklist in view.")
+  else list(col = PAL$seafoam_deep, icon = "🌤️🛡️",
+    head = sprintf("Bear checklist: all clear — %d of %d warning lights on", n, total),
+    body = "No structural damage detected. Even so, remember the standing rule: risk is highest exactly when it feels lowest. An all-clear is a snapshot, not a promise.")
+}
+bt <- bear_tier(bear_score, bear_n, bear_total)
+```
+
+```{r weather-score}
+#| include: false
+
+## ============================================================
+##  🌈 THE WEATHER SCORE — one headline number, 0 to 100,
+##  for people who don't speak finance. HIGHER IS ALWAYS NICER:
+##  100 = clear skies, below 20 = storm warning. No new data —
+##  it repackages four quant signals computed above, each
+##  rescaled so that "more points = better weather":
+##    35%  absence of bear alarms   (100 − Bear Risk Score)
+##    25%  world trend health       (mean Trend Score, all indices)
+##    20%  breadth                  (% of indices above 200-day MA)
+##    20%  calm winds               (VIX 10 → 100 pts … 40+ → 0 pts)
+## ============================================================
+clamp01 <- function(v) pmin(pmax(v, 0), 1)
+vix_calm     <- 100 * clamp01((40 - vix_last) / 30)
+trend_health <- mean(metrics$Trend, na.rm = TRUE)
+weather_score <- round(
+  0.35 * (100 - bear_score) +
+  0.25 * trend_health +
+  0.20 * pct_above200 +
+  0.20 * vix_calm)
+weather_score <- max(0, min(100, weather_score))
+
+## Five tiers, zero jargon — thresholds are fixed, pre-written rules.
+weather_tier <- function(ws) {
+  if (ws >= 80) list(icon = "☀️", label = "CLEAR SKIES", col = PAL$seafoam_deep, bg = PAL$seafoam,
+    text = "Almost everything is pointing the right way: healthy trends, few alarms, calm winds. Enjoy it — but clear skies are a snapshot, not a promise, and markets punish blind faith in nice weather.")
+  else if (ws >= 60) list(icon = "🌤️", label = "MOSTLY SUNNY", col = PAL$seafoam_deep, bg = "#d9f4ea",
+    text = "Conditions are good overall, with a few clouds worth watching. Fine weather for normal plans — just glance at the Bear Watch checklist now and then.")
+  else if (ws >= 40) list(icon = "⛅", label = "CHANGEABLE", col = "#b8912f", bg = PAL$butter,
+    text = "Mixed signals: some gauges are healthy, others are flashing. Neither sunshine nor storm — the kind of sky where you carry a light jacket, i.e. avoid big bets you can't undo.")
+  else if (ws >= 20) list(icon = "🌧️", label = "STORM WATCH", col = PAL$coral_deep, bg = PAL$coral,
+    text = "More warning lights than usual and weakening trends. Not a disaster yet — but this is exactly when careful people check their umbrellas (risk, debt, position sizes).")
+  else list(icon = "⛈️", label = "STORM WARNING", col = "#fff", bg = "#d9635b",
+    text = "Most indicators are flashing at once. Historically, this is what serious downturns look like from the inside. Protecting what you have beats chasing anything.")
+}
+wt <- weather_tier(weather_score)
+```
+
+# ☀️ Executive Weather Summary
+
+```{r banner, results='asis'}
+#| echo: false
+if (USING_DEMO) {
+  cat('<div style="background:#f4837d;color:#fff;padding:14px;border-radius:16px;font-weight:bold;box-shadow:0 4px 14px rgba(244,131,125,.35);">',
+      '⚠️ OFFLINE / DEMO MODE — every live source failed, so this report is built entirely on <em>simulated</em> data. Numbers below are illustrative only.',
+      '</div>')
+} else if (ANY_DEMO) {
+  cat('<div style="background:#ffd3b6;color:#2f4858;padding:12px;border-radius:16px;box-shadow:0 4px 14px rgba(255,211,182,.5);">',
+      '⚠️ Partial data: some series fell back to simulated demo data. See the source tables below.',
+      '</div>')
+} else {
+  cat('<div style="background:#a8e6cf;color:#2f4858;padding:12px;border-radius:16px;box-shadow:0 4px 14px rgba(86,197,168,.35);">',
+      '✅ Live data successfully retrieved for all indices and sectors. Strict mode guarantees this report contains only complete, real data — it refuses to build otherwise.',
+      '</div>')
+}
+```
+
+```{r weather-score-card, results='asis'}
+#| echo: false
+
+## The headline: one giant number anyone can read. 100 = great weather.
+cat(sprintf('<div style="border:4px solid %s;border-radius:24px;padding:20px 24px;margin-top:16px;background:%s;box-shadow:0 8px 24px rgba(47,72,88,.12);text-align:center;">
+<div style="font-size:3em;line-height:1;">%s</div>
+<div style="font-size:3.2em;font-weight:800;line-height:1.1;color:%s;">%d<span style="font-size:0.45em;font-weight:600;opacity:.75;"> / 100</span></div>
+<div style="font-size:1.4em;font-weight:700;letter-spacing:1px;color:%s;">%s</div>
+<p style="font-size:1.05em;max-width:640px;margin:10px auto 6px auto;">%s</p>
+<p style="font-size:0.85em;opacity:0.8;margin:4px 0 0 0;">☀️ 80–100 clear skies · 🌤️ 60–79 mostly sunny · ⛅ 40–59 changeable · 🌧️ 20–39 storm watch · ⛈️ below 20 storm warning<br>
+Built from the quant data below — no opinion involved: 35%% no-alarms + 25%% trend health + 20%% breadth + 20%% calm winds. Higher is always nicer.</p>
+</div>',
+  wt$col, wt$bg, wt$icon, wt$col, weather_score, wt$col, wt$label, wt$text))
+```
+
+```{r weather-score-gauge}
+#| echo: false
+plot_ly(type = "indicator", mode = "gauge+number",
+  value = weather_score,
+  title = list(text = "Market Weather Score — 0 = storm warning ⛈️, 100 = clear skies ☀️ (higher is always nicer)"),
+  gauge = list(
+    axis = list(range = list(0, 100)),
+    bar  = list(color = if (weather_score >= 60) PAL$seafoam_deep else if (weather_score >= 40) PAL$butter_deep else PAL$coral_deep),
+    steps = list(
+      list(range = c(0, 20),   color = "#f4837d"),
+      list(range = c(20, 40),  color = PAL$coral),
+      list(range = c(40, 60),  color = PAL$butter),
+      list(range = c(60, 80),  color = "#d9f4ea"),
+      list(range = c(80, 100), color = PAL$seafoam)))) |>
+  pastel_layout(margin = list(t = 60, b = 10))
+```
+
+```{r tldr, results='asis'}
+#| echo: false
+
+## ---- 10-second TL;DR card: four traffic lights, zero jargon -------------
+tl <- function(v, warm, hot) if (v >= hot) "🔴" else if (v >= warm) "🟡" else "🟢"
+hot1 <- sector_metrics[order(-sector_metrics$Trend), ][1, ]
+mood_word <- if (fear_greed >= 75) "greedy 😀" else if (fear_greed >= 55) "optimistic 🙂" else if (fear_greed >= 45) "balanced 😐" else if (fear_greed >= 25) "nervous 😟" else "fearful 😱"
+odds_1m <- odds_vals[["1 month"]]
+cat(sprintf('<div style="border:3px solid #a8e6cf;border-radius:20px;padding:16px;margin-top:14px;background:linear-gradient(135deg,#f2fbf8 0%%,#eef8fd 100%%);box-shadow:0 6px 18px rgba(129,207,232,.25);">
+<b style="font-size:1.2em;">⚡ The whole report in 10 seconds</b>
+<table style="width:100%%;margin-top:8px;font-size:1.05em;">
+<tr><td>%s <b>Market heat</b></td><td>%d / 100 — how expensive &amp; stretched things are (higher = hotter = riskier)</td></tr>
+<tr><td>%s <b>Bear risk</b></td><td>%d of %d warning lights ON (%d%%) — how many storm alarms are ringing</td></tr>
+<tr><td>%s <b>Investor mood</b></td><td>%d / 100 — the crowd is currently %s</td></tr>
+<tr><td>🎲 <b>Base rate</b></td><td>Over the last ~5½ years, a random 1-month bet on the S&amp;P 500 paid off <b>%.0f%%</b> of the time</td></tr>
+<tr><td>🔥 <b>Hottest theme</b></td><td>%s %s (trend %d/100)</td></tr>
+</table>
+<p style="margin:8px 0 0 0;font-size:0.9em;opacity:0.8;">🟢 = comfortable · 🟡 = pay attention · 🔴 = high alert. Every number is explained below in plain words.</p>
+</div>',
+  tl(composite, 55, 70), composite,
+  tl(bear_score, 25, 40), bear_n, bear_total, bear_score,
+  if (fear_greed >= 75 || fear_greed <= 25) "🔴" else if (fear_greed >= 60 || fear_greed <= 40) "🟡" else "🟢", fear_greed, mood_word,
+  odds_1m,
+  hot1$Sky, hot1$Index, hot1$Trend))
+```
+
+::: {.callout-tip collapse="true" icon="false"}
+## 🎓 New here? The 60-second decoder ring (tap to open)
+
+No finance degree needed — the whole report runs on six ideas:
+
+- **🌈 The Weather Score (the big number at the top).** 0–100, and higher is *always* nicer: 100 = clear skies, below 20 = storm warning. If you read nothing else, read that one number — everything below explains *why* it is what it is.
+- **📏 200-day average ("the trend line").** The average price over the last ~10 months. Price *above* it = long-term uptrend ☀️; *below* it = long-term downtrend 🌧️. That's it.
+- **🌀 RSI ("the speedometer", 0–100).** How fast price has been moving lately. Above 70 = sprinting (often due for a breather); below 30 = collapsed (often due for a bounce); ~50 = cruising.
+- **💨 VIX ("the wind speed").** How violently traders expect prices to swing. Under 20 = calm breeze; over 30 = storm winds.
+- **🗺️ Breadth ("how many boats are floating").** The % of world markets in an uptrend. If the S&P rises but breadth is weak, one big boat is hiding a sinking fleet.
+- **🎲 The 95% band ("19 times out of 20").** Whenever you see a forecast range, read it as: *the model expects the price to land inside this range 19 times out of 20.* The wider the band, the more honest the model is being about not knowing.
+
+**Golden rule of the whole report:** nothing here predicts the future. Everything is either *what already happened* (facts), *what usually happened after similar setups* (probabilities), or *a model's guess with honest error bars* (forecasts — trust them less the further out they go).
+:::
+
+```{r weather-text, results='asis'}
+#| echo: false
+
+## ---- The plain-English weather engine (pure if/else) -------------------
+weather <- function(score, fg, vix, vixavg, breadth) {
+  if (score >= 85) { icon <- "⛈️🌪️"; head <- "SEVERE STORM WARNING"
+    body <- "Markets look dangerously overheated. Valuations are in the top of their historical range and momentum is stretched. Umbrellas up — sudden downpours (corrections) are common from here." }
+  else if (score >= 70) { icon <- "🌧️"; head <- "Stormy & overbought"
+    body <- "The sky is heavy. Prices are rich versus history and breadth is wide, a classic late-cycle look. Enjoy the warmth but keep a raincoat handy." }
+  else if (score >= 55) { icon <- "⛅"; head <- "Warm with building clouds"
+    body <- "Pleasant but pricey. The market is above fair-weather averages; not a storm yet, but the barometer is drifting down." }
+  else if (score >= 40) { icon <- "🌤️"; head <- "Mild and mostly fair"
+    body <- "Comfortable conditions. Valuations and momentum sit near their long-run middle — neither cheap nor expensive." }
+  else if (score >= 25) { icon <- "☁️"; head <- "Cool and overcast"
+    body <- "A grey, cautious mood. Prices are below trend and enthusiasm is muted — the kind of chilly weather that sometimes precedes clear skies." }
+  else { icon <- "🌦️❄️"; head <- "Cold snap / washout"
+    body <- "Deep chill. Markets are beaten down and fearful. Historically, the coldest days have offered the warmest long-term entry points — but frostbite is real." }
+
+  mood <- if (fg >= 75) "😀 Investors are downright greedy."
+    else if (fg >= 55) "🙂 Mood tilts optimistic."
+    else if (fg >= 45) "😐 Sentiment is balanced."
+    else if (fg >= 25) "😟 Nervousness is creeping in."
+    else "😱 Outright fear grips the tape."
+
+  vixline <- if (vix >= 30) "🌪️ The volatility 'wind speed' (VIX) is howling — brace for turbulence."
+    else if (vix >= 20) "💨 Winds (VIX) are gusty and above their calm-weather average."
+    else if (vix < vixavg) "🍃 Winds (VIX) are light and below average — calm seas."
+    else "🍃 Winds (VIX) are moderate."
+
+  brd <- sprintf("🗺️ Breadth check: %.0f%% of world indices are above their 200-day average.", breadth)
+
+  cat(sprintf('<div style="border:3px solid #81cfe8;border-radius:20px;padding:20px;margin-top:14px;background:#ffffff;box-shadow:0 6px 18px rgba(129,207,232,.25);">
+  <div style="font-size:2.4em;">%s</div>
+  <h2 style="margin:4px 0;">%s</h2>
+  <p style="font-size:1.15em;">%s</p>
+  <p>%s</p><p>%s</p><p>%s</p></div>',
+  icon, head, body, mood, vixline, brd))
+}
+weather(composite, fear_greed, vix_last, vix_avg, pct_above200)
+```
+
+```{r bear-box, results='asis'}
+#| echo: false
+active <- bear_signals$Signal[bear_signals$Triggered]
+active_html <- if (length(active)) {
+  paste0("<ul style='margin:6px 0 0 0;'>",
+         paste(sprintf("<li>⚠️ %s</li>", active), collapse = ""), "</ul>")
+} else {
+  "<p style='margin:6px 0 0 0;'>No active warning signals right now.</p>"
+}
+cat(sprintf('<div style="background:%s;color:#fff;padding:16px;border-radius:12px;margin-top:12px;">
+<div style="font-size:1.6em;">%s</div>
+<h3 style="margin:4px 0;color:#fff;">%s</h3>
+<p style="margin:4px 0;">%s</p>%s
+<p style="margin-top:8px;font-size:0.9em;opacity:0.85;">Full checklist, thresholds and what would flip this report bearish: see the 🐻 Bear Watch section.</p></div>',
+  bt$col, bt$icon, bt$head, bt$body, active_html))
+```
+
+```{r hot-cold, results='asis'}
+#| echo: false
+## One-glance hottest / coldest themes, fed by the sector trend scores
+sm <- sector_metrics[order(-sector_metrics$Trend), ]
+hot  <- head(sm, 3); cold <- tail(sm, 3)
+cat(sprintf('<div style="border:2px dashed #56c5a8;border-radius:16px;padding:12px;margin-top:10px;background:#f2fbf8;">
+<b>🔥 Hottest themes right now:</b> %s<br>
+<b>🧊 Coldest themes right now:</b> %s</div>',
+  paste(sprintf("%s %s (%d)", hot$Sky, hot$Index, hot$Trend), collapse = " · "),
+  paste(sprintf("%s %s (%d)", cold$Sky, cold$Index, cold$Trend), collapse = " · ")))
+```
+
+```{r gauge}
+#| echo: false
+gcol <- if (composite >= 70) PAL$coral_deep else if (composite >= 40) PAL$butter_deep else PAL$seafoam_deep
+plot_ly(
+  type = "indicator", mode = "gauge+number",
+  value = composite,
+  title = list(text = "Overall Market 'Heat' Score (0 = cold/cheap, 100 = overheated)"),
+  gauge = list(
+    axis = list(range = list(0, 100)),
+    bar  = list(color = gcol),
+    steps = list(
+      list(range = c(0,25),  color = PAL$seafoam),
+      list(range = c(25,40), color = "#d9f4ea"),
+      list(range = c(40,55), color = PAL$butter),
+      list(range = c(55,70), color = PAL$peach),
+      list(range = c(70,85), color = PAL$coral),
+      list(range = c(85,100),color = "#f4837d")),
+    threshold = list(line = list(color = "black", width = 4),
+                     thickness = 0.8, value = composite))
+) |> pastel_layout(margin = list(t = 60, b = 10))
+```
+
+# 🎲 What Are the Chances?
+
+Forget predictions for a moment — here are the **actual historical odds**, computed live from the ~5½ years of S&P 500 data this report just downloaded. No model, no opinion: just counting.
+
+```{r odds-table}
+#| echo: false
+datatable(odds_tbl, rownames = FALSE, options = list(dom = "t"),
+          caption = "Empirical win-rates: of ALL possible windows of each length in the fetched data, what share ended with the S&P 500 higher than it started?")
+```
+
+```{r odds-text, results='asis'}
+#| echo: false
+cat(sprintf("**The single most useful pattern in this whole report** 📏 — the 200-day trend line genuinely changes the odds:\n\n"))
+cat(sprintf("- When the S&P 500 was **above** its 200-day average ☀️, the next month was positive **%.0f%%** of the time.\n", odds_above))
+cat(sprintf("- When it was **below** 🌧️, the next month was positive only **%.0f%%** of the time.\n\n", odds_below))
+cat(sprintf("**Right now the market is %s its trend line**, so history says the wind is currently %s.\n\n",
+    ifelse(regime_above_now, "☀️ ABOVE", "🌧️ BELOW"),
+    ifelse(regime_above_now, "at its back 🍃", "in its face 💨")))
+cat("🐻 *Honest footnote: these odds come from one ~5½-year sample that includes whatever regime we happen to be in. They are real, but they are weather statistics, not laws of physics — a 70% chance of sunshine still rains 3 days in 10.*\n")
+```
+
+# ⏳ The Market Through Time
+
+The same market looks completely different depending on how far you zoom out. Each subsection below reads one window of time — what happened over that lookback, and (except for 5 years) what the models project over the *same distance ahead*. Forecast confidence shrinks fast as the horizon grows: **1 week/1 month are usable, 3 months is soft, 6 months is indicative, 1 year is directional at best — and 5 years ahead is deliberately not forecast at all.**
+
+```{r horizon-heatmap}
+#| echo: false
+hz <- names(HORIZONS)
+zmat <- as.matrix(horizon_tbl[, hz])
+rownames(zmat) <- horizon_tbl$Asset
+zcap <- pmax(pmin(zmat, 60), -60)     # cap colors at +/-60% so 5y doesn't wash out the scale
+plot_ly(x = hz, y = rownames(zmat), z = round(zcap, 1),
+        customdata = round(zmat, 1),
+        hovertemplate = "%{y}<br>%{x}: %{customdata}%<extra></extra>",
+        type = "heatmap",
+        colors = pastel_diverge,
+        zmin = -60, zmax = 60, height = 700) |>
+  pastel_layout(title = "Return heatmap across time horizons (green = up, red = down; color capped at ±60%)",
+         margin = list(l = 200))
+```
+
+```{r time-sections, results='asis'}
+#| echo: false
+
+## Key assets that get forward projections in every time section
+key_assets <- unique(c("S&P 500", "Nasdaq Composite", "Gold (GLD)", "Bitcoin",
+                       sector_metrics$Index[order(-sector_metrics$Trend)][1]))
+fc_all <- do.call(rbind, lapply(key_assets, function(nm) {
+  x <- if (nm %in% names(market)) market[[nm]] else sector_data[[nm]]
+  horizon_forecast(x, nm)
+}))
+
+section_meta <- list(
+  list(h = "5 Years",  fc = NA_character_,
+       note = "🚫🔮 **No 5-year forecast is shown — on purpose.** Statistical models at that range produce decoration, not information; anyone selling you a confident 5-year number is selling confidence, not analysis."),
+  list(h = "1 Year",   fc = "1 Year ahead",
+       note = "⚠️ The 1-year projection is included as requested, but it is **directional at best** — look at how wide the 95% band is. That width *is* the honest forecast. 🐻 Bear note: a full year is long enough to contain an entire correction that shorter windows won't see coming."),
+  list(h = "6 Months", fc = "6 Months ahead",
+       note = "6-month projections are indicative only. 🐻 Bear note: most historical drawdowns went from 'fine' to 'bear market' in less than six months."),
+  list(h = "3 Months", fc = "3 Months ahead",
+       note = "🐻 Bear note: a quarter is the classic span of a sharp correction — if warning lights are on in Bear Watch, this is the window where they usually bite."),
+  list(h = "1 Month",  fc = "1 Month ahead",
+       note = ""),
+  list(h = "1 Week",   fc = "1 Week ahead",
+       note = "One week is noise more often than signal — never extrapolate a weekly move into a story.")
+)
+
+horizon_mood <- function(med) {
+  if (is.na(med))      "…"
+  else if (med <= -10) "🐻⛈️ **Broad damage over this window** — a genuine storm passed through. Downtrends deserve respect: they end on evidence, not hope."
+  else if (med <= -3)  "🐻🌧️ **Bearish tilt** — more assets fell than rose over this window. Caution is the default setting here."
+  else if (med < 3)    "⛅ Mixed and range-bound — no dominant weather system over this window."
+  else if (med < 10)   "🌤️ Constructive — most assets gained. 🐻 But note: calm windows are exactly where complacency compounds; keep one eye on the Bear Watch checklist."
+  else                 "🔥☀️ Very hot — big, broad gains. 🐻 **Standing bear warning:** heat like this rarely persists, and the strongest stretches historically cluster right before squalls. Strength is not safety."
+}
+
+for (m in section_meta) {
+  cat(sprintf("\n\n## %s\n\n", m$h))
+  vals <- horizon_tbl[[m$h]]
+  med  <- median(vals, na.rm = TRUE)
+  cat(horizon_mood(med), "\n\n")
+  ok  <- which(!is.na(vals))
+  ord <- ok[order(-vals[ok])]
+  top <- head(ord, 3); bot <- rev(tail(ord, 3))
+  cat(sprintf("**Best:** %s. **Worst:** %s.\n\n",
+    paste(sprintf("%s (%+.1f%%)", horizon_tbl$Asset[top], vals[top]), collapse = ", "),
+    paste(sprintf("%s (%+.1f%%)", horizon_tbl$Asset[bot], vals[bot]), collapse = ", ")))
+  sub <- data.frame(Asset = horizon_tbl$Asset, Type = horizon_tbl$Type,
+                    `Return %` = round(vals, 1), check.names = FALSE)
+  sub <- sub[order(-sub$`Return %`, na.last = TRUE), ]
+  print(htmltools::tagList(datatable(sub, rownames = FALSE,
+        options = list(pageLength = 8, dom = "tp"))))
+  if (!is.na(m$fc) && !is.null(fc_all)) {
+    f <- fc_all[fc_all$Horizon == m$fc, c("Asset","Point","Chg %","Lo95","Hi95")]
+    cat(sprintf("\n\n**Looking %s ahead** (auto.arima point forecasts with 95%% bands, key assets):\n\n",
+                tolower(m$h)))
+    print(htmltools::tagList(datatable(f, rownames = FALSE, options = list(dom = "t"))))
+  }
+  if (nzchar(m$note)) cat("\n\n", m$note, "\n\n")
+}
+```
+
+# 🐻 Bear Watch
+
+Bull markets get plenty of cheerleaders; this section exists to argue the other side, every single run. Fourteen independent warning lights are checked automatically — trend breaks, breadth, volatility, divergences, safe-haven rotation, risk appetite, and now the two macro alarms from the Recession & Credit Radar (yield-curve inversion and credit stress). **None of them predicts a crash on its own; it is the *cluster* that matters.** Think of each light as one smoke detector in a large house: one beeping is probably burnt toast 🍞; five beeping at once means leave the building 🏃.
+
+```{r bear-gauge}
+#| echo: false
+bcol <- if (bear_score >= 60) "#d9635b" else if (bear_score >= 40) PAL$coral_deep else if (bear_score >= 25) "#f7b98b" else if (bear_score >= 10) PAL$butter_deep else PAL$seafoam_deep
+plot_ly(type = "indicator", mode = "gauge+number",
+  value = bear_score,
+  title = list(text = "Bear Risk Score (share of warning lights ON)"),
+  gauge = list(axis = list(range = list(0, 100)),
+    bar = list(color = bcol),
+    steps = list(
+      list(range = c(0,10),  color = "#d9f4ea"),
+      list(range = c(10,25), color = PAL$butter),
+      list(range = c(25,40), color = PAL$peach),
+      list(range = c(40,60), color = PAL$coral),
+      list(range = c(60,100),color = "#f4837d")))) |>
+  pastel_layout(margin = list(t = 60, b = 10))
+```
+
+```{r bear-table}
+#| echo: false
+btab <- data.frame(Light = ifelse(bear_signals$Triggered, "🔴 ON", "🟢 off"),
+                   `Warning signal` = bear_signals$Signal, check.names = FALSE)
+datatable(btab, rownames = FALSE, options = list(pageLength = 14, dom = "t"),
+          caption = sprintf("The %d-light bear checklist, evaluated live on every render.", bear_total))
+```
+
+```{r bear-narrative, results='asis'}
+#| echo: false
+cat(sprintf("**Current reading: %s** — %s\n\n", bt$head, bt$body))
+cat("**What would flip this report outright bearish** (pre-written rules, not opinion):\n\n")
+cat("- 📉 S&P 500 closing below its 200-day average **and** breadth under 50% — the trend regime flips.\n")
+cat("- ☠️ A fresh death cross on the S&P 500 or Nasdaq while the VIX holds above 25.\n")
+cat("- 🩸 A composite heat score ≥ 70 followed by a negative 20-day momentum turn — overheated *and* rolling over is the classic topping sequence.\n")
+cat("- 🥇 Gold and the VIX rising together while equities fall — money running for shelter, not rotating.\n")
+cat("- 🪙 Crypto down hard (>15%/month) alongside small caps lagging — the risk-appetite canaries going quiet first.\n\n")
+cat("🐻 *Standing reminder: drawdowns are a feature of markets, not a malfunction. The S&P 500 has historically averaged an intra-year drawdown of roughly double digits even in positive years — position sizing, not prediction, is what survives them.*\n")
+```
+
+# 🛰️ Recession & Credit Radar
+
+Three "grown-up" macro instruments most private investors never look at — translated into plain weather language. All three are free and key-less.
+
+## 🏦 The bond market's recession alarm (yield curve)
+
+Normally, lending money for 10 years pays more than lending for 2 (you're locked in longer). When that flips — the curve **inverts** — the bond market is effectively saying *"we expect trouble ahead."* Historically this alarm has rung before most US recessions, usually with a long delay.
+
+```{r yield-curve-chart}
+#| echo: false
+if (!is.null(yield_curve)) {
+  ycv <- as.numeric(yield_curve)
+  plot_ly(x = index(yield_curve), y = ycv, type = "scatter", mode = "lines",
+          name = "10y − 2y spread",
+          line = list(color = PAL$ink)) |>
+    pastel_layout(title = "Yield curve: 10-year minus 2-year Treasury yield (%). Below the red line = inverted = recession alarm ringing.",
+           yaxis = list(title = "%"),
+           shapes = list(list(type = "line",
+             x0 = min(index(yield_curve)), x1 = max(index(yield_curve)),
+             y0 = 0, y1 = 0, line = list(color = PAL$coral_deep, dash = "dash"))))
+} else {
+  cat("Yield-curve data (FRED DGS10 − DGS2) could not be fetched on this run — the chart is skipped, and the corresponding Bear Watch light stays off rather than guessing.")
+}
+```
+
+```{r yield-curve-text, results='asis'}
+#| echo: false
+if (!is.na(yc_now)) {
+  cat(if (yc_inverted)
+    sprintf("🚨 **The alarm is ringing:** the curve is inverted at %.2f%%. In plain English: bond investors are paid *more* for short loans than long ones — a bet that rates (and the economy) will cool. 🐻 Important nuance: the lag between inversion and actual trouble has historically ranged from months to ~2 years, so this is a *seasonal forecast*, not tomorrow's weather.\n", yc_now)
+  else if (yc_now < 0.5)
+    sprintf("🟡 **Flat-ish at %+.2f%%** — the alarm isn't ringing, but the battery light is on. Curves this flat mean the bond market sees little runway; watch for a dip below zero.\n", yc_now)
+  else
+    sprintf("🟢 **Healthy slope at %+.2f%%** — the bond market is not bracing for recession. One less thing to worry about (today).\n", yc_now))
+}
+```
+
+## 💳 Are lenders getting nervous? (credit stress)
+
+Junk bonds (risky loans, tracked by HYG) versus quality bonds (safe loans, LQD). When investors happily hold risky debt, this ratio rises 🟢. When they quietly flee to safety, it rolls over 🔴 — and credit usually smells trouble **before** the stock market does. Think of it as the canary that works in a bank.
+
+```{r credit-chart}
+#| echo: false
+if (!is.null(credit_ratio)) {
+  crv <- as.numeric(credit_ratio)
+  cr_sma <- as.numeric(SMA(crv, 200))
+  plot_ly(x = index(credit_ratio), y = crv, type = "scatter", mode = "lines",
+          name = "HYG / LQD") |>
+    add_lines(x = index(credit_ratio), y = cr_sma, name = "200d average",
+              line = list(color = "#b39ddb", dash = "dot")) |>
+    pastel_layout(title = paste0("Credit-stress canary: junk bonds ÷ quality bonds",
+                          if (credit_demo) " ⚠️ (built on simulated fallback data this run)" else ""),
+           yaxis = list(title = "HYG / LQD ratio"), hovermode = "x unified")
+} else {
+  cat("Credit ratio could not be built on this run — chart skipped, Bear Watch light stays off.")
+}
+```
+
+```{r credit-text, results='asis'}
+#| echo: false
+if (!is.na(credit_roc20)) {
+  cat(if (credit_stress)
+    sprintf("🔴 **The canary looks unwell:** risky bonds are below their trend line and fell %.1f%% vs quality bonds over the last month. Lenders are edging toward the exits — historically an early-warning pattern worth respecting.\n", abs(credit_roc20))
+  else if (isTRUE(credit_below200))
+    "🟡 **Slightly pale canary:** the ratio is below its long-term trend but not actively falling. Worth a glance each week, not a panic.\n"
+  else
+    sprintf("🟢 **The canary is singing:** investors are comfortable holding risky debt (ratio %+.1f%% over the last month, above trend). Credit sees no storm on the radar.\n", credit_roc20))
+  if (credit_demo) cat("\n⚠️ *Caveat: one or both bond series fell back to simulated data this run, so this reading is illustrative only and was excluded from the Bear Watch count.*\n")
+}
+```
+
+## 🤿 How far underwater? (drawdown)
+
+The most intuitive risk chart that exists: at every moment, how far below its **all-time-high-so-far** was the S&P 500? Zero = at a record high 🏔️. Every dip below zero is time spent "underwater" — this is what owning stocks actually *feels* like.
+
+```{r drawdown-chart}
+#| echo: false
+plot_ly(x = spx_dates, y = dd_series, type = "scatter", mode = "lines",
+        fill = "tozeroy", fillcolor = "rgba(244,131,125,0.30)",
+        line = list(color = PAL$coral_deep), name = "Drawdown %") |>
+  pastel_layout(title = "S&P 500 — % below its running record high ('the underwater chart')",
+         yaxis = list(title = "% below peak"),
+         shapes = list(
+           list(type = "line", x0 = min(spx_dates), x1 = max(spx_dates),
+                y0 = -10, y1 = -10, line = list(color = PAL$butter_deep, dash = "dot")),
+           list(type = "line", x0 = min(spx_dates), x1 = max(spx_dates),
+                y0 = -20, y1 = -20, line = list(color = "red", dash = "dot"))))
+```
+
+```{r drawdown-text, results='asis'}
+#| echo: false
+worst_dd <- min(dd_series, na.rm = TRUE)
+pct_under10 <- mean(dd_series <= -10, na.rm = TRUE) * 100
+cat(sprintf("**Right now:** the S&P 500 is **%.1f%%** below its record high %s\n\n",
+    abs(dd_now),
+    if (dd_now > -3) "— essentially at the surface 🏔️😎."
+    else if (dd_now > -10) "— a normal dip 🌊, the kind markets produce almost every year."
+    else if (dd_now > -20) "— officially a **correction** 🤿 (10–20% down). Uncomfortable, historically common."
+    else "— officially a **bear market** 🐻🌊 (20%+ down). Painful, and historically also where long-term returns were born."))
+cat(sprintf("**Perspective from this dataset:** the deepest dive of the last ~5½ years was **%.0f%%**, and the market spent about **%.0f%%** of all days at least 10%% underwater. Feeling seasick occasionally is the admission price of equity returns — the orange (−10%%) and red (−20%%) lines are there to show how routine it is.\n", abs(worst_dd), pct_under10))
+```
+
+# 🌍 World Indices Dashboard
+
+```{r source-table}
+#| echo: false
+src_df <- data.frame(Index = names(source_log), Source = unname(source_log))
+datatable(src_df, rownames = FALSE, options = list(pageLength = 5, dom = "tp"),
+          caption = "Which data source succeeded for each index (fallback cascade result).")
+```
+
+```{r dash-table}
+#| echo: false
+show <- metrics |>
+  transmute(` ` = Sky, Index,
+            `Trend (0-100)` = Trend,
+            Last = round(Last, 2),
+            `1D %` = round(Ret1D, 2),
+            `20D %` = round(ROC20, 2),
+            RSI = round(RSI, 1),
+            `% vs 200d MA` = round((Last/SMA200 - 1)*100, 1),
+            `% from 52w High` = round(FromHigh, 1),
+            Cross,
+            `In plain English` = Reading)
+datatable(show, rownames = FALSE,
+          options = list(pageLength = 12, order = list(list(2, "desc"))),
+          caption = "Live technical snapshot with the same weather scoring as the sector radar (0 = deep freeze, 100 = blazing). Sort any column.") |>
+  formatStyle("1D %", color = styleInterval(0, c(PAL$down, PAL$up))) |>
+  formatStyle("Trend (0-100)",
+              background = styleColorBar(c(0, 100), PAL$sky),
+              backgroundSize = "95% 70%",
+              backgroundRepeat = "no-repeat",
+              backgroundPosition = "center")
+```
+
+```{r norm-chart}
+#| echo: false
+## Normalized performance (rebased to 100) for a readable comparison
+pick <- c("S&P 500","Nasdaq Composite","FTSE 100","DAX","Nikkei 225","Hang Seng")
+pick <- intersect(pick, names(market))
+p <- plot_ly()
+for (nm in pick) {
+  cl <- Cl(market[[nm]]); cl <- cl[!is.na(cl)]
+  reb <- as.numeric(cl)/as.numeric(cl[1])*100
+  p <- add_lines(p, x = index(cl), y = reb, name = nm)
+}
+p |> pastel_layout(title = "Normalized performance (rebased to 100)",
+            yaxis = list(title = "Index = 100 at start"),
+            hovermode = "x unified")
+```
+
+# 📊 Regional Deep Dives
+
+```{r regional, results='asis'}
+#| echo: false
+for (reg in c("North America","Europe","Asia-Pacific","Latin America")) {
+  nm_reg <- intersect(indices$name[indices$region == reg], names(market))
+  if (!length(nm_reg)) next
+  cat(sprintf("\n\n## %s\n\n", reg))
+  sub <- metrics[metrics$Index %in% nm_reg, ]
+  print(htmltools::tagList(datatable(
+    sub |> transmute(Index, Last=round(Last,1), `20D %`=round(ROC20,1),
+                     RSI=round(RSI,1), Cross,
+                     `% vs 200d`=round((Last/SMA200-1)*100,1)),
+    rownames = FALSE, options = list(dom = "t", pageLength = 10))))
+}
+```
+
+# 🧭 Sector & Theme Radar
+
+Your watchlist — quantum, AI, space, energy, crypto, gold, silver, rare earths, oil, financials, industrials — plus the themes that complete the picture: **semiconductors** (the hardware side of the AI trade), **cybersecurity**, **defense & aerospace**, **uranium/nuclear**, **clean energy**, **copper** (the electrification metal) and **biotech**. Each theme is tracked through its most liquid ETF or native symbol, fetched through the same key-less multi-source fallback cascade. Because many of these trade on *story and flows* rather than earnings, this section is deliberately **trend-first**: the Trend Score below measures only price behaviour, not value.
+
+```{r sector-sources}
+#| echo: false
+ssrc <- data.frame(Theme = names(sector_source_log), Source = unname(sector_source_log))
+datatable(ssrc, rownames = FALSE, options = list(pageLength = 5, dom = "tp"),
+          caption = "Data source that succeeded for each sector/theme.")
+```
+
+## 🌤️ The Sector Weather Map
+
+```{r sector-map}
+#| echo: false
+smap <- sector_metrics[order(-sector_metrics$Trend), ] |>
+  transmute(` ` = Sky, Theme = Index,
+            `Trend (0-100)` = Trend,
+            `20D %` = round(ROC20, 1),
+            `60D %` = round(ROC60, 1),
+            `RS vs S&P (60d)` = round(RSvsSPX60, 1),
+            `% from 52w High` = round(FromHigh, 1),
+            Forecast = Reading)
+datatable(smap, rownames = FALSE,
+          options = list(pageLength = 20, dom = "t"),
+          caption = "Themes ranked by pure price trend. 'RS vs S&P' = 60-day change of the theme/S&P-500 ratio: positive means the theme is beating the broad market.") |>
+  formatStyle("Trend (0-100)",
+              background = styleColorBar(c(0, 100), PAL$sky),
+              backgroundSize = "95% 70%",
+              backgroundRepeat = "no-repeat",
+              backgroundPosition = "center") |>
+  formatStyle("RS vs S&P (60d)", color = styleInterval(0, c(PAL$coral_deep, PAL$seafoam_deep)))
+```
+
+## 📈 Theme performance, rebased
+
+```{r sector-norm}
+#| echo: false
+p <- plot_ly()
+for (nm in names(sector_data)) {
+  cl <- Cl(sector_data[[nm]]); cl <- cl[!is.na(cl)]
+  cl <- tail(cl, 252)                         # ~1 trading year for readability
+  reb <- as.numeric(cl)/as.numeric(cl[1])*100
+  vis <- if (nm %in% head(sector_metrics$Index[order(-sector_metrics$Trend)], 6)) TRUE else "legendonly"
+  p <- add_lines(p, x = index(cl), y = reb, name = nm, visible = vis)
+}
+p |> pastel_layout(title = "Themes rebased to 100 (last ~12 months). Top-6 trends shown; click legend to toggle the rest.",
+            yaxis = list(title = "Rebased = 100"),
+            hovermode = "x unified")
+```
+
+## 💪 Relative strength vs the S&P 500
+
+```{r sector-rs}
+#| echo: false
+rs <- sector_metrics[order(-sector_metrics$RSvsSPX60), ]
+plot_ly(rs, x = ~RSvsSPX60, y = ~reorder(Index, RSvsSPX60), type = "bar",
+        orientation = "h",
+        marker = list(color = ifelse(rs$RSvsSPX60 >= 0, PAL$seafoam_deep, PAL$coral_deep))) |>
+  pastel_layout(title = "60-day relative strength vs S&P 500 (%). Right = leading, left = lagging.",
+         xaxis = list(title = "Ratio change, %"), yaxis = list(title = ""),
+         margin = list(l = 200))
+```
+
+## 🔗 How the themes move together
+
+```{r sector-cor}
+#| echo: false
+## Correlation of daily returns across themes (last 120 common sessions)
+rets <- NULL
+for (nm in names(sector_data)) {
+  r <- dailyReturn(Cl(sector_data[[nm]]))
+  colnames(r) <- nm
+  rets <- if (is.null(rets)) r else merge(rets, r, join = "outer")
+}
+rets <- tail(rets[complete.cases(rets), ], 120)
+if (nrow(rets) >= 30) {
+  cm <- cor(rets)
+  plot_ly(x = colnames(cm), y = rownames(cm), z = round(cm, 2),
+          type = "heatmap", colors = colorRamp(c(PAL$sky_deep, "#ffffff", PAL$coral_deep)),
+          zmin = -1, zmax = 1) |>
+    pastel_layout(title = "Correlation of daily returns (last ~120 sessions). Red = moves together, blue = moves opposite.",
+           margin = list(l = 180, b = 160))
+} else {
+  cat("Not enough overlapping history to compute a stable correlation matrix.")
+}
+```
+
+## 🔮 Sector forecasts (top trends + Bitcoin)
+
+```{r sector-forecast}
+#| echo: false
+fc_names <- unique(c(head(sector_metrics$Index[order(-sector_metrics$Trend)], 3),
+                     "Bitcoin"))
+fc_names <- intersect(fc_names, names(sector_data))
+plots <- lapply(fc_names, function(nm) {
+  cl <- as.numeric(Cl(sector_data[[nm]])); cl <- cl[!is.na(cl)]
+  fit <- tryCatch(forecast::auto.arima(tail(cl, 300)), error = function(e) NULL)
+  if (is.null(fit)) fit <- forecast::ets(tail(cl, 300))
+  fc <- forecast::forecast(fit, h = 30)
+  hx <- tail(index(Cl(sector_data[[nm]])), 300)
+  fdt <- next_bdays(max(hx), 30)
+  plot_ly() |>
+    add_lines(x = hx, y = tail(cl, 300), name = "History") |>
+    add_lines(x = fdt, y = as.numeric(fc$mean), name = "Forecast",
+              line = list(dash = "dash", color = PAL$coral_deep)) |>
+    add_ribbons(x = fdt, ymin = as.numeric(fc$lower[,2]),
+                ymax = as.numeric(fc$upper[,2]),
+                name = "95% band", opacity = 0.2, line = list(width = 0)) |>
+    pastel_layout(title = paste(nm, "— 30-session forecast (auto.arima / ets)"),
+           hovermode = "x unified", showlegend = FALSE)
+})
+htmltools::tagList(plots)
+```
+
+Forecasting only the strongest trends (plus Bitcoin) keeps render time short; univariate models extrapolate trend and mean-reversion, which is exactly the behaviour that matters most for these flow-driven themes — and exactly why the confidence bands are wide.
+
+# 🥇 Gold Deep Dive
+
+Gold is the market's barometer of fear, real interest rates and currency doubt — which is why it gets its own weather station. Everything below runs on the same fallback cascade (GLD as the tradeable proxy, ~1/10 oz per share, so *levels* are ETF prices but every trend, ratio and signal is identical to spot).
+
+```{r gold-weather, results='asis'}
+#| echo: false
+gm <- sector_metrics[sector_metrics$Index == "Gold (GLD)", ]
+gold_story <- {
+  if (gm$Trend >= 70 && isTRUE(sp_row$ROC20 < 0))
+    "🥇⛈️ **Safe-haven weather.** Gold is in a strong uptrend while stocks stumble — the textbook risk-off pattern. 🐻 When gold leads and equities lag, treat every equity bounce with suspicion until breadth repairs."
+  else if (gm$Trend >= 70)
+    "🥇☀️ **Gold is shining on its own merits** — strong uptrend even without an equity storm. Often a real-rates or currency story. 🐻 Bear note for gold itself: parabolic phases in gold historically end with sharp 10–20% air pockets; strength is not immunity."
+  else if (gm$Trend >= 50)
+    "🥇🌤️ **Constructive but unhurried.** Gold trends gently higher — insurance quietly appreciating."
+  else if (gm$Trend >= 35)
+    "🥇⛅ **Drifting.** Gold is range-bound; the market currently sees little to hedge. That itself is information — hedges are cheapest when nobody wants them."
+  else
+    "🥇🌧️ **Out of favor.** Gold is in a downtrend — typically a strong-real-rates, strong-risk-appetite regime. 🐻 Ironically, gold weakness plus euphoric equities is its own late-cycle warning."
+}
+cat(gold_story, "\n\n")
+cat(sprintf("**Gold snapshot:** Trend Score %d/100 · RSI %.0f · %+.1f%% vs 200-day MA · %+.1f%% from 52-week high · 60-day relative strength vs S&P 500: %+.1f%%.\n",
+    gm$Trend, gm$RSI, (gm$Last/gm$SMA200 - 1)*100, gm$FromHigh, gm$RSvsSPX60))
+```
+
+## Price structure: candles, moving averages, Bollinger bands, support/resistance
+
+```{r gold-candles}
+#| echo: false
+gx <- sector_data[["Gold (GLD)"]]
+gt <- tail(gx, 250)
+gcl_full <- as.numeric(Cl(gx))
+bb <- tryCatch(TTR::BBands(Cl(gx), n = 20, sd = 2), error = function(e) NULL)
+res_lvl <- max(as.numeric(Hi(tail(gx, 60))), na.rm = TRUE)   # 60-session resistance
+sup_lvl <- min(as.numeric(Lo(tail(gx, 60))), na.rm = TRUE)   # 60-session support
+idx250 <- (nrow(gx) - nrow(gt) + 1):nrow(gx)
+p <- plot_ly(x = index(gt), type = "candlestick",
+        open = as.numeric(Op(gt)), high = as.numeric(Hi(gt)),
+        low = as.numeric(Lo(gt)), close = as.numeric(Cl(gt)), name = "Gold (GLD)") |>
+  add_lines(x = index(gt), y = as.numeric(SMA(Cl(gx), 50))[idx250],
+            name = "50d MA", line = list(color = PAL$butter_deep)) |>
+  add_lines(x = index(gt), y = as.numeric(SMA(Cl(gx), 200))[idx250],
+            name = "200d MA", line = list(color = "#b39ddb"))
+if (!is.null(bb)) {
+  p <- p |>
+    add_lines(x = index(gt), y = as.numeric(bb[idx250, "up"]),
+              name = "Bollinger up", line = list(color = "#c5cae9", dash = "dot")) |>
+    add_lines(x = index(gt), y = as.numeric(bb[idx250, "dn"]),
+              name = "Bollinger down", line = list(color = "#c5cae9", dash = "dot"))
+}
+p |> pastel_layout(title = sprintf("Gold — last 250 sessions. Support ≈ %.1f, resistance ≈ %.1f (60-session extremes)", sup_lvl, res_lvl),
+            xaxis = list(rangeslider = list(visible = FALSE)),
+            shapes = list(
+              list(type = "line", x0 = min(index(gt)), x1 = max(index(gt)),
+                   y0 = res_lvl, y1 = res_lvl, line = list(color = PAL$coral_deep, dash = "dash")),
+              list(type = "line", x0 = min(index(gt)), x1 = max(index(gt)),
+                   y0 = sup_lvl, y1 = sup_lvl, line = list(color = PAL$seafoam_deep, dash = "dash"))))
+```
+
+## Momentum panels: RSI and MACD
+
+```{r gold-momentum}
+#| echo: false
+grsi  <- as.numeric(RSI(Cl(gx), 14))
+gmacd <- tryCatch(TTR::MACD(Cl(gx)), error = function(e) NULL)
+p_rsi <- plot_ly(x = index(gt), y = grsi[idx250], type = "scatter",
+                 mode = "lines", name = "RSI(14)") |>
+  pastel_layout(yaxis = list(title = "RSI", range = c(0, 100)),
+         shapes = list(
+           list(type="line", x0=min(index(gt)), x1=max(index(gt)), y0=70, y1=70,
+                line=list(color=PAL$coral_deep, dash="dot")),
+           list(type="line", x0=min(index(gt)), x1=max(index(gt)), y0=30, y1=30,
+                line=list(color=PAL$seafoam_deep, dash="dot"))))
+if (!is.null(gmacd)) {
+  hist <- as.numeric(gmacd[idx250,"macd"] - gmacd[idx250,"signal"])
+  p_macd <- plot_ly(x = index(gt), y = hist, type = "bar", name = "MACD hist",
+                    marker = list(color = ifelse(hist >= 0, PAL$seafoam_deep, PAL$coral_deep))) |>
+    add_lines(x = index(gt), y = as.numeric(gmacd[idx250,"macd"]), name = "MACD") |>
+    add_lines(x = index(gt), y = as.numeric(gmacd[idx250,"signal"]), name = "Signal") |>
+    pastel_layout(yaxis = list(title = "MACD"))
+  subplot(p_rsi, p_macd, nrows = 2, shareX = TRUE, titleY = TRUE) |>
+    pastel_layout(title = "Gold momentum: RSI(14) with 30/70 bands, MACD(12,26,9)")
+} else p_rsi
+```
+
+```{r gold-momentum-text, results='asis'}
+#| echo: false
+r_now <- tail(grsi[!is.na(grsi)], 1)
+cat(if (r_now >= 70) "📈🔥 RSI is in **overbought** territory — trends can stay overbought for a long time, but chasing entries here has poor odds. 🐻 A drop back below 70 after a stay above it is a classic short-term exhaustion signal.\n"
+    else if (r_now <= 30) "🧊 RSI is **oversold** — panic territory. Historically better for patient accumulation than for capitulation, but catching knives requires gloves (position sizing).\n"
+    else if (r_now >= 55) "🌤️ RSI sits in the bullish half of its range — momentum supports the trend without being stretched.\n"
+    else "⛅ RSI is neutral-to-soft — momentum is not confirming a strong move in either direction.\n")
+```
+
+## Gold ratios: versus silver and versus stocks
+
+```{r gold-ratios}
+#| echo: false
+slv <- sector_data[["Silver (SLV)"]]
+m1 <- merge(Cl(gx), Cl(slv), join = "inner"); m1 <- m1[complete.cases(m1), ]
+gs_ratio <- as.numeric(m1[,1]) / as.numeric(m1[,2])
+m2 <- merge(Cl(gx), spx_cl, join = "inner"); m2 <- m2[complete.cases(m2), ]
+gspx <- as.numeric(m2[,1]) / as.numeric(m2[,2]); gspx <- gspx / gspx[1] * 100
+p1 <- plot_ly(x = index(m1), y = gs_ratio, type = "scatter", mode = "lines",
+              name = "Gold/Silver (ETF ratio)") |>
+  pastel_layout(yaxis = list(title = "GLD / SLV"))
+p2 <- plot_ly(x = index(m2), y = gspx, type = "scatter", mode = "lines",
+              name = "Gold vs S&P (rebased)", line = list(color = "#e6c97a")) |>
+  pastel_layout(yaxis = list(title = "Gold/S&P, rebased = 100"))
+subplot(p1, p2, nrows = 2, shareX = TRUE, titleY = TRUE) |>
+  pastel_layout(title = "Gold/Silver ratio (ETF-based — trend identical to the oz ratio) and Gold vs S&P 500")
+```
+
+```{r gold-ratio-text, results='asis'}
+#| echo: false
+gsr_now <- tail(gs_ratio, 1); gsr_avg <- mean(gs_ratio)
+cat(if (gsr_now > gsr_avg * 1.1) "⚖️ The gold/silver ratio is **elevated versus its own average** — gold outrunning silver is typically defensive, fear-tinged demand. 🐻 A stretched ratio plus weak equities has historically accompanied risk-off phases.\n"
+    else if (gsr_now < gsr_avg * 0.9) "⚖️ The gold/silver ratio is **compressed** — silver outperforming usually signals reflation/industrial optimism rather than fear.\n"
+    else "⚖️ The gold/silver ratio sits near its recent average — no strong fear or reflation message from the metals complex.\n")
+grel <- tail(gspx, 1)
+cat(if (grel > 105) "\n📊 Gold has been **beating the stock market** over this window — the shelter trade is winning, which is itself a quiet bear signal for equities.\n"
+    else if (grel < 95) "\n📊 Stocks have been beating gold over this window — risk appetite has had the upper hand.\n"
+    else "\n📊 Gold and stocks are roughly tied over this window.\n")
+```
+
+## The real-rates check (gold's gravity)
+
+```{r gold-real-yield}
+#| echo: false
+real_yield <- tryCatch({
+  dgs10 <- getSymbols("DGS10",  src = "FRED", auto.assign = FALSE)
+  bei10 <- getSymbols("T10YIE", src = "FRED", auto.assign = FALSE)
+  ry <- merge(dgs10, bei10, join = "inner"); ry <- ry[complete.cases(ry), ]
+  r <- ry[,1] - ry[,2]; colnames(r) <- "RealYield10Y"
+  tail(r, 500)
+}, error = function(e) NULL)
+if (!is.null(real_yield)) {
+  plot_ly(x = index(real_yield), y = as.numeric(real_yield),
+          type = "scatter", mode = "lines", name = "10Y real yield (%)") |>
+    pastel_layout(title = "US 10-year real yield (FRED: DGS10 − T10YIE). Falling real yields = tailwind for gold; rising = headwind.",
+           yaxis = list(title = "%"))
+} else {
+  cat("Real-yield data (FRED DGS10 − T10YIE) could not be fetched on this run — skipping the chart. The logic still holds: gold tends to rise when *real* (inflation-adjusted) rates fall, because the cost of holding a yieldless asset drops.")
+}
+```
+
+## Gold through time & ahead
+
+```{r gold-horizons}
+#| echo: false
+grow <- horizon_tbl[horizon_tbl$Asset == "Gold (GLD)", names(HORIZONS)]
+gh <- data.frame(Horizon = names(HORIZONS),
+                 `Return %` = round(as.numeric(unlist(grow[1, ])), 1), check.names = FALSE)
+gfc <- if (!is.null(fc_all)) fc_all[fc_all$Asset == "Gold (GLD)",
+        c("Horizon","Point","Chg %","Lo95","Hi95")] else NULL
+htmltools::tagList(
+  datatable(gh, rownames = FALSE, options = list(dom = "t"),
+            caption = "Gold: realized returns by lookback window."),
+  if (!is.null(gfc)) datatable(gfc, rownames = FALSE, options = list(dom = "t"),
+            caption = "Gold: model projections by horizon (no 5-year forecast — see methodology). The 1-year row is directional at best.")
+)
+```
+
+# 📈 Technical Trend Readings
+
+```{r candle}
+#| echo: false
+nm <- "S&P 500"; x <- market[[nm]]; x <- tail(x, 180)
+plot_ly(x = index(x), type = "candlestick",
+        open = as.numeric(Op(x)), high = as.numeric(Hi(x)),
+        low = as.numeric(Lo(x)), close = as.numeric(Cl(x)), name = nm) |>
+  add_lines(x = index(x), y = as.numeric(SMA(Cl(market[[nm]]),50))[(nrow(market[[nm]])-179):nrow(market[[nm]])],
+            name = "50d MA", line = list(color="orange")) |>
+  pastel_layout(title = paste(nm, "— last 180 sessions with 50-day MA"),
+         xaxis = list(rangeslider = list(visible = FALSE)))
+```
+
+The dashboard tables above already report RSI, MACD histogram, 20/60-day rate-of-change, distance from the 52-week high/low, and golden/death-cross detection for every index and theme via the `TTR` package.
+
+# 💰 Valuation & Overbought Score
+
+```{r val-table}
+#| echo: false
+vdf <- data.frame(
+  Metric = c("Shiller CAPE (multpl.com)","Trailing P/E (multpl.com)",
+             "Buffett Indicator proxy (FRED SP500/GDP)",
+             "% of indices above 200d MA","Average RSI (equities)",
+             "COMPOSITE HEAT SCORE"),
+  Value = c(round(cape,1), round(pe,1),
+            ifelse(is.na(buffett),"n/a",round(buffett,1)),
+            paste0(round(pct_above200),"%"), round(avg_rsi,1),
+            composite))
+datatable(vdf, rownames = FALSE, options = list(dom = "t"),
+          caption = "Valuation composite inputs. CAPE 35%, P/E 20%, RSI 20%, breadth 25%.")
+```
+
+The composite weights the Shiller CAPE most heavily (35%) because it is the most robust long-horizon valuation signal, then trailing P/E (20%), average RSI (20%), and breadth (25%). The Buffett Indicator is shown as a labelled proxy only, because FRED removed the Wilshire 5000 series (WILL5000PR) on June 3 2024. Note: the composite is computed on the **world index universe**, not the sector themes — that separation is deliberate, since the themes are trend-scored rather than value-scored.
+
+# 🌡️ Sentiment, Cycle & Liquidity
+
+```{r cycle, results='asis'}
+#| echo: false
+## Simple 4-phase Wyckoff-style classification on the S&P 500
+sp <- metrics[metrics$Index == "S&P 500", ]
+phase <- {
+  if (isTRUE(sp$AboveSMA200) && sp$ROC20 > 0) "Markup (uptrend) 🚀"
+  else if (isTRUE(sp$AboveSMA200) && sp$ROC20 <= 0) "Distribution (topping) 🏔️"
+  else if (!isTRUE(sp$AboveSMA200) && sp$ROC20 < 0) "Markdown (downtrend) 📉"
+  else "Accumulation (basing) 🌱"
+}
+cat(sprintf("**Estimated cycle phase (S&P 500):** %s\n\n", phase))
+cat(sprintf("**Fear/Greed gauge:** %d / 100.\n\n", fear_greed))
+cat(sprintf("**Volatility:** VIX %.1f vs 60-day average %.1f.\n\n", vix_last, vix_avg))
+```
+
+```{r volume}
+#| echo: false
+#| results: asis
+## Volume / low-liquidity check on S&P 500
+volx <- Vo(market[["S&P 500"]])
+if (!is.null(volx) && sum(as.numeric(volx), na.rm=TRUE) > 0) {
+  vv <- as.numeric(volx); recent <- tail(vv,5); avg <- mean(tail(vv,60))
+  cat(sprintf("Recent 5-day average volume is %.0f%% of the 60-day average — %s.",
+      mean(recent)/avg*100,
+      ifelse(mean(recent)/avg < 0.8, "unusually thin (low-conviction moves)","normal participation")))
+}
+```
+
+Bid-ask spreads are not available on free feeds, so liquidity here is proxied by volume trends and by the VIX. The fear/greed gauge is built from three computable inputs — 20-day momentum, VIX versus its 60-day average, and the breadth of indices above their 200-day average — using only freely fetchable data.
+
+# 🔮 Forecasts
+
+```{r forecast}
+#| echo: false
+nm <- "S&P 500"; cl <- as.numeric(Cl(market[[nm]])); cl <- cl[!is.na(cl)]
+fit <- tryCatch(forecast::auto.arima(tail(cl, 750)), error = function(e) NULL)
+if (is.null(fit)) fit <- forecast::ets(tail(cl, 750))
+fc <- forecast::forecast(fit, h = 252, level = c(80, 95))
+hx <- tail(index(Cl(market[[nm]])), 750)
+fdt <- next_bdays(max(hx), 252)
+marks <- FC_STEPS
+p <- plot_ly() |>
+  add_lines(x = hx, y = tail(cl, 750), name = "History") |>
+  add_ribbons(x = fdt, ymin = as.numeric(fc$lower[,2]),
+              ymax = as.numeric(fc$upper[,2]),
+              name = "95% band", opacity = 0.15, line = list(width = 0)) |>
+  add_ribbons(x = fdt, ymin = as.numeric(fc$lower[,1]),
+              ymax = as.numeric(fc$upper[,1]),
+              name = "80% band", opacity = 0.25, line = list(width = 0)) |>
+  add_lines(x = fdt, y = as.numeric(fc$mean), name = "Point forecast",
+            line = list(dash = "dash", color = PAL$coral_deep)) |>
+  add_markers(x = fdt[marks], y = as.numeric(fc$mean[marks]),
+              name = "1w · 1m · 3m · 6m · 1y marks",
+              marker = list(size = 9, color = "black"))
+p |> pastel_layout(title = paste(nm, "— full-year fan chart with horizon marks (auto.arima). Watch the bands widen: that widening IS the forecast."),
+            hovermode = "x unified")
+```
+
+```{r forecast-plain, results='asis'}
+#| echo: false
+## Translate the 95% bands into plain-probability sentences
+lastp <- tail(cl, 1)
+band_line <- function(step, label) {
+  lo <- (as.numeric(fc$lower[step, 2]) / lastp - 1) * 100
+  hi <- (as.numeric(fc$upper[step, 2]) / lastp - 1) * 100
+  sprintf("- **%s from now** 🎲: 19 times out of 20, the model expects the S&P 500 to land somewhere between **%+.0f%%** and **%+.0f%%**.\n", label, lo, hi)
+}
+cat("**The same chart in plain probability language** (this is the honest version of every price target you'll ever read):\n\n")
+cat(band_line(21,  "1 month"))
+cat(band_line(63,  "3 months"))
+cat(band_line(252, "1 year"))
+cat("\nNotice how the 1-year range is wide enough to contain both a great year *and* a bad one at the same time. 🤷 That's not the model failing — that's the model being **honest**. Anyone quoting you a single confident 1-year number has simply deleted the error bars.\n")
+```
+
+```{r forecast-table}
+#| echo: false
+if (!is.null(fc_all)) {
+  datatable(fc_all, rownames = FALSE,
+            options = list(pageLength = 25, dom = "t"),
+            caption = "All key-asset projections at every horizon (1 week to 1 year ahead). No 5-year forecasts — deliberately.") |>
+    formatStyle("Chg %", color = styleInterval(0, c(PAL$coral_deep, PAL$seafoam_deep)))
+}
+```
+
+**The reliability ladder** — how much to trust each row above:
+
+- **1 week ahead** 🟢 — usable; mostly mean-reversion and momentum carry-over.
+- **1 month ahead** 🟢 — usable; still anchored to current trend and volatility.
+- **3 months ahead** 🟡 — soft; regime changes start to dominate model structure.
+- **6 months ahead** 🟠 — indicative only; the 95% band typically spans an entire correction and recovery.
+- **1 year ahead** 🔴 — directional at best; included because requested, trusted at your peril. 🐻 A year is long enough for the entire weather system to change twice.
+- **5 years ahead** ⛔ — not produced. Univariate models at that range are astrology with confidence intervals.
+
+Forecasts use `forecast::auto.arima()` with an `ets()` fallback — chosen over prophet to keep the document dependency-light and reproducible at any date. These are naive univariate extrapolations and must not be read as predictions.
+
+# 📚 Methodology Appendix
+
+- **Data cascade (reliability-first, fully key-less).** Every index *and every sector theme* is fetched through a chain of up to eight REAL sources — none of which needs an API key — each network call retried 3x with backoff: (1–2) Yahoo v8 JSON on two independent hosts, (3) quantmod/Yahoo, (4) quantmod/Stooq, (5) direct Stooq CSV, (6–7) a designated backup ETF for the same exposure via Yahoo and Stooq, (8) FRED official close-only series for the major indices. The winning source is recorded and shown in the dashboards. **Strict mode (default): if every real source fails for any asset, the render aborts with an error naming it — an incomplete or simulated report is never produced.** The simulated generator survives only behind `STRICT_DATA=false` for offline layout testing. Lookback is ~5.6 years so the 5-year horizon always resolves.
+- **Time horizons.** Realized returns are computed over calendar windows (7/30/91/182/365/1826 days, using the last close on or before the cutoff). Forward projections read horizons off a *single* 252-step `auto.arima` forecast per key asset at 5/21/63/126/252 trading days — one fit, five readings, no re-estimation drift. **No 5-year-ahead forecast is produced**; the 1-year row is retained but explicitly labelled directional-at-best.
+- **Bear Watch.** Fourteen binary warning lights (trend breaks, correction/bear thresholds, breadth < 50%, death crosses, VIX level and spike, negative momentum, near-high-but-weak-RSI divergence proxy, gold-over-stocks rotation, crypto risk-appetite drain, heat-score danger zone, yield-curve inversion, credit stress). Bear Risk Score = share of lights ON; alert text is pure if/else on that score. The executive summary always surfaces the active signals. The credit-stress light is suppressed (kept off) when either bond ETF fell back to simulated data.
+- **Recession & Credit Radar.** (1) Yield curve = FRED DGS10 − DGS2, key-less; inversion (<0) trips a bear light. (2) Credit stress = HYG/LQD closing ratio through the same 5-source cascade; stress = ratio below its 200-day SMA *and* falling over 20 sessions. (3) Drawdown = close ÷ running maximum − 1, with −10%/−20% reference lines.
+- **Historical odds ("What Are the Chances?").** Pure counting on the fetched S&P 500 closes: for each window length k ∈ {1, 5, 21, 63, 126, 252} trading days, the share of all k-day windows ending higher. Conditional odds split the forward-21-day return by the price-vs-200-day-SMA regime on the entry day. Overlapping windows are used (they are not independent samples — stated in the on-page footnote), and results are sample-specific to the ~5.6-year lookback.
+- **Probability translations.** All 95% forecast intervals are additionally rendered as "19 times out of 20" plain-language ranges relative to the last close, so non-specialists read distributions instead of false point certainty.
+- **Trend indicators (TTR):** 50/200-day SMAs, RSI(14), MACD(12,26,9) histogram, 20/60-day ROC, 52-week high/low distance, golden/death-cross detection, 50-day-MA slope.
+- **Sector Trend Score (0–100):** 15 pts price>50d MA + 15 pts price>200d MA + 10 pts 50d>200d + 15 pts rising 50d MA + 15 pts scaled ROC20 + 20 pts scaled ROC60 + 10 pts proximity to 52-week high. Pure price behaviour, no valuation — deliberate for themes that trade on flows and narrative.
+- **Relative strength:** 60-day change of the theme/S&P-500 price ratio.
+- **Gold deep dive:** GLD candles with 50/200-day MAs and Bollinger(20,2); support/resistance = 60-session low/high extremes; RSI/MACD panels; gold/silver ETF ratio (trend-identical to the oz ratio); gold/S&P rebased ratio; US 10-year real yield from FRED (DGS10 − T10YIE, no API key needed) as gold's macro gravity; horizon returns and projections. All commentary is pre-written if/else on RSI zones, ratio-vs-average and trend score.
+- **Weather Score (0–100, higher is always nicer):** the single headline number for non-specialists, shown first in the executive summary. `0.35·(100 − Bear Risk Score) + 0.25·mean(world Trend Scores) + 0.20·breadth + 0.20·VIX calmness`, where VIX calmness maps VIX 10 → 100 points down to VIX 40+ → 0. Fixed plain-English tiers: ☀️ 80–100 clear skies, 🌤️ 60–79 mostly sunny, ⛅ 40–59 changeable, 🌧️ 20–39 storm watch, ⛈️ <20 storm warning. It introduces **no new data** — it is a deliberately readable repackaging of four signals computed elsewhere in the report, each rescaled so more points = better weather.
+- **Composite heat score (0–100):** `0.35·CAPE + 0.20·P/E + 0.20·RSI + 0.25·breadth`, each sub-score min-max scaled to historical ranges; computed on world indices only.
+- **Fear/greed gauge:** equal-weight blend of momentum, VIX-vs-average, and breadth.
+- **Cycle phase:** simple rules on price-vs-200d MA and 20-day momentum (accumulation / markup / distribution / markdown).
+- **Weather text:** pure if/else on the composite, the sector trend scores, the bear score, the gauge, VIX and breadth — the maths runs silently and only plain English with emojis is surfaced.
+
+# ⚠️ Disclaimer
+
+This report is generated automatically for **educational and illustrative purposes only**. It is **not financial advice**, not a recommendation to buy or sell any security or crypto-asset, and may contain errors or simulated data. Past performance and model forecasts do not guarantee future results. Consult a licensed professional before investing.

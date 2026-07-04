@@ -1,0 +1,140 @@
+/*-- scss:defaults --*/
+
+// Fonts first: CSS @import must be the first statement in the compiled
+// stylesheet or browsers silently ignore it. Rounded picture-book
+// headings (Baloo 2) + friendly body (Nunito), with system fallbacks.
+@import url('https://fonts.googleapis.com/css2?family=Baloo+2:wght@500;600;700&family=Nunito:ital,wght@0,400;0,600;0,700;1,400&display=swap');
+
+// 🌊 Seafoam & Sky — matches the PAL list in market-weather-report.qmd
+$seafoam:       #a8e6cf;
+$seafoam-deep:  #56c5a8;
+$sky:           #b3e5fc;
+$sky-deep:      #81cfe8;
+$butter:        #fff3b0;
+$butter-deep:   #ffe07a;
+$peach:         #ffd3b6;
+$coral:         #ffaaa5;
+$coral-deep:    #f4837d;
+$lavender:      #e4d9ff;
+$ink:           #2f4858;
+$teal-ink:      #00695c;
+$cloud:         #f2fbf8;
+$cloud-blue:    #eef8fd;
+
+$font-family-sans-serif: "Nunito", "Segoe UI", sans-serif;
+$headings-font-family:   "Baloo 2", "Nunito", sans-serif;
+
+$body-bg:      $cloud;        // seafoam-tinted page background
+$body-color:   $ink;
+$link-color:   $teal-ink;
+$headings-color: $teal-ink;   // deep-teal headings
+
+$border-radius: 14px;
+$code-block-bg: $cloud-blue;
+$code-color:    $teal-ink;
+
+// Tables
+$table-hover-bg: rgba(168, 230, 207, 0.25);   // seafoam hover stripe
+
+/*-- scss:rules --*/
+
+/* ---------- Gradient seafoam → sky title banner ---------- */
+#title-block-header {
+  background: linear-gradient(120deg, $seafoam 0%, $sky 100%);
+  border-radius: 22px;
+  padding: 1.6rem 2rem;
+  margin-bottom: 1.5rem;
+  box-shadow: 0 6px 18px rgba(129, 207, 232, 0.35);
+
+  .title    { color: $teal-ink; font-family: "Baloo 2", sans-serif; }
+  .subtitle { color: $ink; opacity: 0.85; }
+  .quarto-title-meta { color: $ink; }
+}
+
+/* ---------- Sky-blue side panels ---------- */
+#quarto-sidebar, .sidebar {
+  background-color: $cloud-blue;
+}
+
+/* ---------- Pill-shaped table-of-contents links ---------- */
+#TOC a, nav#toc-sidebar a, .sidebar nav a {
+  border-radius: 999px;
+  padding: 4px 12px;
+  display: inline-block;
+  margin: 2px 0;
+  color: $ink;
+  transition: background 0.15s ease;
+
+  &:hover  { background: $sky; text-decoration: none; }
+  &.active { background: $seafoam; color: $teal-ink; font-weight: 700; }
+}
+
+/* ---------- Every chart in a soft white card, gentle blue shadow ---------- */
+.plotly, .js-plotly-plot, .cell-output-display > div:has(.plotly),
+.quarto-figure, .figure {
+  background: #ffffff;
+  border-radius: 18px;
+  padding: 10px;
+  box-shadow: 0 6px 18px rgba(129, 207, 232, 0.25);
+  margin-bottom: 1.2rem;
+}
+
+/* ---------- Tables: sky headers, seafoam hover ---------- */
+table thead th,
+.dataTable thead th,
+table.dataTable thead th {
+  background-color: $sky !important;
+  color: $teal-ink !important;
+  border-bottom: 2px solid $sky-deep !important;
+}
+table tbody tr:hover,
+table.dataTable tbody tr:hover {
+  background-color: rgba(168, 230, 207, 0.25) !important;
+}
+table { border-radius: 12px; overflow: hidden; }
+
+/* ---------- Rounded candy-colored callout boxes ---------- */
+div.callout {
+  border-radius: 18px;
+  border-left-width: 6px !important;
+  box-shadow: 0 4px 14px rgba(47, 72, 88, 0.08);
+  overflow: hidden;
+}
+div.callout-tip       { border-left-color: $seafoam-deep !important;
+  .callout-header { background: $seafoam; color: $teal-ink; } }
+div.callout-note      { border-left-color: $sky-deep !important;
+  .callout-header { background: $sky; color: $ink; } }
+div.callout-warning   { border-left-color: $butter-deep !important;
+  .callout-header { background: $butter; color: $ink; } }
+div.callout-important { border-left-color: $coral-deep !important;
+  .callout-header { background: $coral; color: $ink; } }
+div.callout-caution   { border-left-color: $peach !important;
+  .callout-header { background: $peach; color: $ink; } }
+
+/* ---------- Code-fold button: friendly pill ---------- */
+details > summary,
+.code-fold-btn, button.code-fold-btn {
+  background: $lavender;
+  color: $ink;
+  border-radius: 999px;
+  padding: 4px 14px;
+  border: none;
+  font-family: "Nunito", sans-serif;
+  font-weight: 600;
+  cursor: pointer;
+
+  &:hover { background: $sky; }
+}
+div.sourceCode {
+  border-radius: 14px;
+  border: 1px solid $sky;
+}
+
+/* ---------- Section headings get a soft underline ---------- */
+h2 {
+  border-bottom: 3px solid $seafoam;
+  padding-bottom: 0.2em;
+}
+
+/* ---------- Paged df-print tables ---------- */
+.pagedtable-header-name { color: $teal-ink; }
