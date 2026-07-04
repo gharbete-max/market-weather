@@ -1,0 +1,119 @@
+# Save at: .github/workflows/monthly-report.yml
+#
+# WHAT IT DOES
+#   1st of every month, 07:00 UTC â†’ renders market-weather-report.qmd
+#   â†’ pushes the HTML to the `gh-pages` branch â†’ GitHub Pages serves it.
+#
+# WHAT YOU NEED
+#   Nothing. No secrets, no API keys, no settings.
+#   GITHUB_TOKEN is provided automatically by GitHub to every workflow run.
+#   On a public repo, pushing the `gh-pages` branch auto-enables Pages.
+#   (If the site ever doesn't show up: Settings â†’ Pages should say
+#    "Deploy from a branch: gh-pages / (root)" â€” set it once and forget it.)
+#
+# WHERE THE REPORT LIVES
+#   Latest:   https://<username>.github.io/<repo>/
+#   Archive:  https://<username>.github.io/<repo>/market-weather-YYYY-MM.html
+#   Old months are kept forever on the gh-pages branch (no 90-day expiry).
+#
+# NOTE ON THE SCHEDULE
+#   GitHub pauses cron workflows after 60 days of zero repo activity.
+#   This workflow pushes a commit every month, which counts as activity,
+#   so it keeps itself alive. You can also trigger it any time with the
+#   "Run workflow" button in the Actions tab.
+
+name: Monthly Market Weather Report
+
+on:
+  schedule:
+    - cron: "0 7 1 * *"   # 07:00 UTC on the 1st of every month
+  workflow_dispatch:        # manual "Run workflow" button
+
+permissions:
+  contents: write           # needed only to push the gh-pages branch
+
+concurrency:
+  group: monthly-report
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          use-public-rspm: true
+
+      - name: Set up Quarto
+        uses: quarto-dev/quarto-actions/setup@v2
+
+      - name: Install system libraries
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev
+
+      - name: Install R packages (cached between runs)
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::quantmod
+            any::TTR
+            any::xts
+            any::zoo
+            any::plotly
+            any::DT
+            any::forecast
+            any::rvest
+            any::httr
+            any::jsonlite
+            any::dplyr
+            any::tidyr
+            any::htmltools
+            any::tibble
+            any::knitr
+            any::rmarkdown
+
+      # Strict data mode: the report refuses to build on incomplete data.
+      # Data-source hiccups are transient, so try up to 3 times, 5 min apart.
+      - name: Render the report (strict data mode; up to 3 attempts)
+        env:
+          STRICT_DATA: "true"
+        run: |
+          set -u
+          ok=0
+          for attempt in 1 2 3; do
+            echo "=== Render attempt $attempt/3 ==="
+            if quarto render market-weather-report.qmd; then
+              ok=1
+              break
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "Attempt $attempt failed (likely a transient data-source outage) â€” retrying in 5 minutesâ€¦"
+              sleep 300
+            fi
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "All 3 render attempts failed."
+            exit 1
+          fi
+
+      - name: Assemble the site
+        run: |
+          echo "REPORT_MONTH=$(date +%Y-%m)" >> "$GITHUB_ENV"
+          mkdir -p _site
+          cp market-weather-report.html _site/index.html
+          cp market-weather-report.html "_site/market-weather-$(date +%Y-%m).html"
+          touch _site/.nojekyll
+
+      # keep_files: true â†’ previous months already on gh-pages are preserved,
+      # so the archive grows permanently. index.html is overwritten each month.
+      - name: Publish to GitHub Pages (gh-pages branch)
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./_site
+          keep_files: true
+          commit_message: "Market Weather Report â€” ${{ env.REPORT_MONTH }}"
